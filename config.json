@@ -8,7 +8,7 @@
   "homepage": "https://github.com/ThorNeoV/OneMonitor",
   "changelogUrl": "https://github.com/ThorNeoV/OneMonitor/blob/main/README.md",
   "configUrl": "https://github.com/ThorNeoV/OneMonitor/blob/main/config.json",
-  "downloadUrl": "https://github.com/ThorNeoV/OneMonitor.zip",
+  "downloadUrl": "https://github.com/ThorNeoV/OneMonitor/archive/refs/heads/main.zip",
   "repository": {
     "type": "git",
     "url": "}https://github.com/ThorNeoV/OneMonitor.git"
@@ -16,3 +16,4 @@
   "meshCentralCompat": ">=1.0.0"
 
 }
+
