@@ -5,13 +5,13 @@
   "author": "Thorsten Klingelhoeffer",
   "description": "Monitors OneDriveCheckService, restarts if offline, shows status in device view.",
   "hasAdminPanel": true,
-  "homepage": "https://optrade.co.za/store/",
-  "changelogUrl": "",
-  "configUrl": "https://optrade.co.za/store/onedrivecheck/config.json",
-  "downloadUrl": "https://optrade.co.za/store/onedrive-check.zip",
+  "homepage": "https://github.com/ThorNeoV/OneMonitor",
+  "changelogUrl": "https://github.com/ThorNeoV/OneMonitor/blob/main/README.md",
+  "configUrl": "https://github.com/ThorNeoV/OneMonitor/blob/main/config.json",
+  "downloadUrl": "https://github.com/ThorNeoV/OneMonitor.git",
   "repository": {
-    "type": "",
-    "url": ""
+    "type": "git",
+    "url": "}https://github.com/ThorNeoV/OneMonitor.git"
   },
   "meshCentralCompat": ">=1.0.0"
 }
