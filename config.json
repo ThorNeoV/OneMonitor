@@ -1,0 +1,17 @@
+{
+  "name": "OneDriveCheckService Monitor",
+  "shortName": "onedrivecheck",
+  "version": "0.1.0",
+  "author": "Thorsten Klingelhoeffer",
+  "description": "Monitors OneDriveCheckService, restarts if offline, shows status in device view.",
+  "hasAdminPanel": true,
+  "homepage": "https://optrade.co.za/store/",
+  "changelogUrl": "",
+  "configUrl": "https://optrade.co.za/store/onedrivecheck/config.json",
+  "downloadUrl": "https://optrade.co.za/store/onedrive-check.zip",
+  "repository": {
+    "type": "",
+    "url": ""
+  },
+  "meshCentralCompat": ">=1.0.0"
+}
