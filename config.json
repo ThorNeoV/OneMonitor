@@ -6,14 +6,12 @@
   "description": "Monitors OneDriveCheckService, restarts if offline, shows status in device view.",
   "hasAdminPanel": true,
   "homepage": "https://github.com/ThorNeoV/OneMonitor",
-  "changelogUrl": "https://github.com/ThorNeoV/OneMonitor/blob/main/README.md",
-  "configUrl": "https://github.com/ThorNeoV/OneMonitor/blob/main/config.json",
+  "changelogUrl": "https://raw.githubusercontent.com/ThorNeoV/OneMonitor/main/README.md",
+  "configUrl": "https://raw.githubusercontent.com/ThorNeoV/OneMonitor/main/config.json",
   "downloadUrl": "https://github.com/ThorNeoV/OneMonitor/archive/refs/heads/main.zip",
   "repository": {
     "type": "git",
-    "url": "}https://github.com/ThorNeoV/OneMonitor.git"
+    "url": "https://github.com/ThorNeoV/OneMonitor.git"
   },
   "meshCentralCompat": ">=1.0.0"
-
 }
-
