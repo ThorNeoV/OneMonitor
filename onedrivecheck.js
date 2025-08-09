@@ -8,64 +8,66 @@
 
 "use strict";
 
+/** OneDriveCheckService Monitor (devtools-style, robust attach)
+ * shortName: onedrivecheck
+ */
 module.exports.onedrivecheck = function (parent) {
   const obj = {};
   obj.parent = parent;
-  obj.meshServer = parent.parent;          // same as devtools sample
-  const ws = parent.webserver;             // webserver object
-  const app = (ws && ws.app && typeof ws.app.get === "function") ? ws.app : null;
+  obj.meshServer = parent.parent;
+  const ws = parent.webserver;
 
-  // --- logging helpers ------------------------------------------------------
-  function logInfo(m){ try { obj.meshServer.info("onedrivecheck: " + m); } catch{} }
-  function logDbg(m){ try { obj.meshServer.debug("onedrivecheck: " + m); } catch{} }
-  function logErr(e){ try { obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); } catch{} }
+  // ---------- logging
+  function log(m){ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{} }
+  function dbg(m){ try{ obj.meshServer.debug("onedrivecheck: " + m); }catch{} }
+  function err(e){ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{} }
 
-  // --- webRoot helpers ------------------------------------------------------
+  // ---------- webRoot helpers
   const webRoot = (ws && ws.webRoot) || "/";
-  const baseNoSlash = webRoot.endsWith("/") ? webRoot.slice(0, -1) : webRoot;
+  const baseNoSlash = webRoot.endsWith("/") ? webRoot.slice(0,-1) : webRoot;
   const R = (p) => baseNoSlash + p;
 
-  // --- simple file-backed storage (settings + per-node statuses) ------------
+  // ---------- tiny file store (settings + per-node status)
   const fs = require("fs");
   const path = require("path");
   const plugindir = __dirname;
-  function readJson(name){ try { return JSON.parse(fs.readFileSync(path.join(plugindir, name), "utf8")); } catch { return null; } }
-  function writeJson(name, v){ try { fs.writeFileSync(path.join(plugindir, name), JSON.stringify(v||{},null,2)); } catch(e){ logErr(e);} }
+  const readJson = (n)=>{ try{ return JSON.parse(fs.readFileSync(path.join(plugindir,n),"utf8")); }catch{ return null; } };
+  const writeJson = (n,v)=>{ try{ fs.writeFileSync(path.join(plugindir,n), JSON.stringify(v||{},null,2)); }catch(e){ err(e);} };
 
-  let settings = { meshId: null, pollInterval: 60 }; // seconds
+  let settings = { meshId:null, pollInterval:60 };
   let pollTimer = null;
   const statusesFile = "statuses.json";
-  const statusKey = (id) => `status:${id}`;
-  function getStatus(id){ const all = readJson(statusesFile) || {}; return all[statusKey(id)] || null; }
-  function setStatus(id, val){ const all = readJson(statusesFile) || {}; all[statusKey(id)] = Object.assign({ lastChecked: Date.now() }, val||{}); writeJson(statusesFile, all); }
+  const statusKey = (id)=>`status:${id}`;
+  const getStatus = (id)=>{ const all = readJson(statusesFile)||{}; return all[statusKey(id)]||null; };
+  const setStatus = (id,val)=>{ const all = readJson(statusesFile)||{}; all[statusKey(id)] = Object.assign({lastChecked:Date.now()}, val||{}); writeJson(statusesFile, all); };
 
-  // Load settings once at startup
   (function loadSettings(){
     const s = readJson("settings.json");
     if (s) settings = Object.assign(settings, s);
-    logInfo("settings=" + JSON.stringify(settings));
+    log("settings=" + JSON.stringify(settings));
   })();
 
-  // --- req.user checker -----------------------------------------------------
+  // ---------- auth helper
   function isAdmin(req){
     if (!req || !req.user) return false;
     const u = req.user;
-    return !!(u.siteadmin || u.domainadmin || u.admin || u.isadmin || u.superuser || ((u.siteadmin|0) !== 0));
+    return !!(u.siteadmin || u.domainadmin || u.admin || u.isadmin || u.superuser || ((u.siteadmin|0)!==0));
   }
 
-  // --- attach routes AFTER cookie-session is present ------------------------
+  // ---------- wait for express app & session, then attach
+  function getApp(){ return (ws && ws.app && typeof ws.app.get === "function") ? ws.app : null; }
   function appHasSession(a){
     try {
       if (!a || !a._router || !Array.isArray(a._router.stack)) return false;
-      return a._router.stack.some((layer) => {
+      return a._router.stack.some((layer)=>{
         const n = (layer && (layer.name || (layer.handle && layer.handle.name))) || "";
         return /session|cookie/i.test(n);
       });
     } catch { return false; }
   }
 
-  function attachRoutes(){
-    // Debug route (helps verify req.user)
+  function attachRoutes(app){
+    // Debug route
     app.get(R("/plugin/onedrivecheck/debug"), function(req,res){
       res.json({
         webRoot, url: req.originalUrl || req.url,
@@ -83,7 +85,7 @@ module.exports.onedrivecheck = function (parent) {
       res.json({ ok:true, user:{ name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } });
     });
 
-    // Admin UI
+    // Admin GET
     app.get(R("/plugin/onedrivecheck/admin"), function(req,res){
       if (!isAdmin(req)) { res.status(403).end("Forbidden"); return; }
       const html = `<!doctype html>
@@ -103,7 +105,7 @@ module.exports.onedrivecheck = function (parent) {
       res.end(html);
     });
 
-    // urlencoded fallback (no express dependency)
+    // urlencoded fallback
     function manualUrlencoded(req,res,next){
       if (req.method !== "POST") return next();
       const ctype = (req.headers["content-type"]||"").toLowerCase();
@@ -123,12 +125,13 @@ module.exports.onedrivecheck = function (parent) {
       });
     }
 
+    // Admin POST
     app.post(R("/plugin/onedrivecheck/admin"), manualUrlencoded, function(req,res){
       if (!isAdmin(req)) { res.status(403).end("Forbidden"); return; }
       if (req.body && typeof req.body.meshId === "string") settings.meshId = req.body.meshId.trim();
       if (req.body && req.body.pollInterval) settings.pollInterval = Math.max(10, parseInt(req.body.pollInterval,10) || 60);
       writeJson("settings.json", settings);
-      logInfo("settings saved: " + JSON.stringify(settings));
+      log("settings saved: " + JSON.stringify(settings));
       schedulePolling(true);
       res.writeHead(302, { Location: R("/plugin/onedrivecheck/admin") });
       res.end();
@@ -145,7 +148,7 @@ module.exports.onedrivecheck = function (parent) {
       res.json(out);
     });
 
-    // UI JS (public, CSP-safe)
+    // UI JS
     app.get(R("/plugin/onedrivecheck/ui.js"), function(req,res){
       const js = String.raw`(function(){
   function qTable(){ return document.querySelector('#devices, #devicesTable'); }
@@ -225,29 +228,28 @@ module.exports.onedrivecheck = function (parent) {
       res.end(js);
     });
 
-    logInfo("routes attached at webRoot=" + webRoot);
+    log("routes attached at webRoot=" + webRoot);
   }
 
-  if (!app) {
-    logErr("webserver.app not found; cannot attach routes");
-  } else {
-    // Wait until cookie-session is present so req.user works.
+  // poll for app -> then poll for session -> then attach
+  (function waitForApp(){
+    const app = getApp();
+    if (!app) { setTimeout(waitForApp, 1000); return; }
     let tries = 0;
-    (function waitForSession(){
+    (function waitSession(){
       tries++;
-      if (appHasSession(app)) { attachRoutes(); return; }
-      if (tries > 60) { logErr("session middleware not detected; attaching anyway"); attachRoutes(); return; }
-      setTimeout(waitForSession, 1000);
+      if (appHasSession(app) || tries > 60) { attachRoutes(app); return; }
+      setTimeout(waitSession, 1000);
     })();
-  }
+  })();
 
-  // --- Inject UI on page load (Mesh calls this on login/refresh) ------------
+  // ---------- UI injection
   obj.onWebUIStartupEnd = function () {
     const base = webRoot.endsWith("/") ? webRoot : (webRoot + "/");
     return `<script src="${base}plugin/onedrivecheck/ui.js"></script>`;
   };
 
-  // --- Polling logic (Windows agents only) ----------------------------------
+  // ---------- polling (Windows agents)
   function sendShell(nodeId, cmd){
     return new Promise((resolve)=>{
       const payload = { cmd, type: "powershell" };
@@ -256,40 +258,33 @@ module.exports.onedrivecheck = function (parent) {
       });
     });
   }
-
   async function checkPort(nodeId, port){
     const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "(Test-NetConnection -ComputerName localhost -Port ${port}).TcpTestSucceeded"`;
     const out = await sendShell(nodeId, cmd);
     return /true/i.test(out);
   }
-
   async function restartService(nodeId){
     const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Try { Restart-Service -Name OneDriveCheckService -Force -ErrorAction Stop; 'OK' } Catch { 'ERR:' + $_ }"`;
     await sendShell(nodeId, cmd);
-    logDbg("Restarted OneDriveCheckService on " + nodeId);
+    dbg("Restarted OneDriveCheckService on " + nodeId);
   }
-
   function getDevicesInMesh(meshId){
     return new Promise((resolve)=>{
       try {
-        obj.meshServer.db.GetAllType("node", (nodes)=>{
-          const map = {};
-          (nodes||[]).forEach((n)=>{ if (n.meshid === meshId) map[n._id] = n; });
+        obj.meshServer.db.GetAllType("node",(nodes)=>{
+          const map={}; (nodes||[]).forEach((n)=>{ if(n.meshid===meshId) map[n._id]=n; });
           resolve(map);
         });
-      } catch(e){ logErr(e); resolve({}); }
+      } catch(e){ err(e); resolve({}); }
     });
   }
-
   async function poll(){
-    try {
-      if (!settings.meshId) return;
+    try{
+      if(!settings.meshId) return;
       const nodes = await getDevicesInMesh(settings.meshId);
       for (const nodeId of Object.keys(nodes||{})) {
-        const d = nodes[nodeId];
-        const osd = (d.osdesc||"").toLowerCase();
+        const d = nodes[nodeId]; const osd = (d.osdesc||"").toLowerCase();
         if (!osd.includes("windows")) continue;
-
         const port20707 = await checkPort(nodeId, 20707);
         const port20773 = await checkPort(nodeId, 20773);
         const status = {
@@ -298,20 +293,18 @@ module.exports.onedrivecheck = function (parent) {
           port20773: !!port20773
         };
         setStatus(nodeId, status);
-
         if (!port20707 && !port20773) await restartService(nodeId);
       }
-    } catch(e){ logErr(e); }
+    } catch(e){ err(e); }
   }
-
   function schedulePolling(runNow){
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    if (!settings.meshId) { logInfo("no meshId set; not polling"); return; }
+    if (pollTimer) { clearInterval(pollTimer); pollTimer=null; }
+    if (!settings.meshId) { log("no meshId set; not polling"); return; }
     const ms = Math.max(10, parseInt(settings.pollInterval||60,10))*1000;
     pollTimer = setInterval(poll, ms);
     if (runNow) poll();
   }
-  schedulePolling(true); // start if meshId already set
+  schedulePolling(true);
 
   return obj;
 };
