@@ -1,6 +1,6 @@
 "use strict";
 
-/** OneDriveCheck – UI via pluginadmin bridge (auth-safe, no express routes) */
+/** OneDriveCheck – UI via pluginadmin bridge (auth-safe, LIVE status) */
 module.exports.onedrivecheck = function (parent) {
   const obj = {};
   obj.parent = parent;
@@ -9,31 +9,83 @@ module.exports.onedrivecheck = function (parent) {
   const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{ console.log("onedrivecheck:", m); } };
   const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{ console.error("onedrivecheck error:", e); } };
 
-  // tiny persisted map (mock status until you hook real checks)
-  const fs = require("fs");
-  const path = require("path");
-  const statusFile = path.join(__dirname, "statuses.json");
-  function readStatuses(){ try{ return JSON.parse(fs.readFileSync(statusFile,"utf8")); }catch{ return {}; } }
-  function writeStatuses(v){ try{ fs.writeFileSync(statusFile, JSON.stringify(v||{},null,2)); }catch(e){ err(e); } }
-  function hashCode(s){ let h=0; for (let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i); h|=0;} return h; }
-  function mockStatusFor(id){
-    const h = readStatuses();
-    if (!h[id]) {
-      const states = [
-        { status:"App Online",    port20707:true,  port20773:false },
-        { status:"Not signed in", port20707:false, port20773:true  },
-        { status:"Offline",       port20707:false, port20773:false }
-      ];
-      h[id] = states[Math.abs(hashCode(id)) % states.length];
-      writeStatuses(h);
-    }
-    return h[id];
-  }
-
+  // ----- helpers
   function summarizeUser(u){
     if (!u) return null;
     const { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } = u;
     return { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser };
+  }
+  function briefHeaders(req){
+    const h = (req && req.headers) || {};
+    const keep = ["host","user-agent","x-forwarded-for","x-forwarded-proto","x-forwarded-host","cf-ray","accept"];
+    const o = {}; keep.forEach(k=>{ if(h[k]) o[k]=h[k]; });
+    o.cookieLength = (h.cookie||"").length;
+    return o;
+  }
+
+  // ===== LIVE STATUS CHECKS =====
+  const CACHE_TTL_MS = 15000; // 15s
+  const cache = new Map(); // nodeId -> { t:number, val:{status,port20707,port20773} }
+
+  function isAgentOnline(nodeId){
+    try {
+      const a = obj.meshServer.webserver && obj.meshServer.webserver.wsagents;
+      return !!(a && a[nodeId]);
+    } catch { return false; }
+  }
+
+  function sendShell(nodeId, cmd){
+    return new Promise((resolve)=>{
+      if (!obj.meshServer || typeof obj.meshServer.sendCommand !== "function") { resolve(""); return; }
+      const payload = { cmd, type: "powershell" };
+      let done = false;
+      const timer = setTimeout(()=>{ if(!done){ done=true; resolve(""); } }, 6000); // 6s timeout
+      try {
+        obj.meshServer.sendCommand(nodeId, "shell", payload, function (resp){
+          if (done) return;
+          done = true; clearTimeout(timer);
+          resolve(resp && resp.data ? String(resp.data) : "");
+        });
+      } catch(e){
+        if (done) return;
+        done = true; clearTimeout(timer);
+        resolve("");
+      }
+    });
+  }
+
+  function parseBool(s){ return /true/i.test(String(s||"")); }
+
+  async function checkNodeLive(nodeId){
+    // If agent is offline, report Offline straight away
+    if (!isAgentOnline(nodeId)) {
+      return { status:"Offline", port20707:false, port20773:false };
+    }
+
+    // Single PowerShell to test two ports and print simple CSV: "p1=true;p2=false"
+    const ps = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ' +
+      "\"$p1=(Test-NetConnection -ComputerName localhost -Port 20707 -WarningAction SilentlyContinue).TcpTestSucceeded; " +
+      "$p2=(Test-NetConnection -ComputerName localhost -Port 20773 -WarningAction SilentlyContinue).TcpTestSucceeded; " +
+      "Write-Output ('p1=' + $p1 + ';p2=' + $p2)\"";
+
+    const out = await sendShell(nodeId, ps);
+    const m = /p1\s*=\s*(true|false).*?p2\s*=\s*(true|false)/i.exec(out||"");
+    const p1 = m ? parseBool(m[1]) : false;
+    const p2 = m ? parseBool(m[2]) : false;
+
+    const status = p1 ? "App Online" : (p2 ? "Not signed in" : "Offline");
+    return { status, port20707: !!p1, port20773: !!p2 };
+  }
+
+  async function getStatusFor(nodeId){
+    // cache
+    const now = Date.now();
+    const c = cache.get(nodeId);
+    if (c && (now - c.t) < CACHE_TTL_MS) return c.val;
+
+    const val = await checkNodeLive(nodeId);
+    cache.set(nodeId, { t: now, val });
+    return val;
   }
 
   // ========== AUTHENTICATED BRIDGE ==========
@@ -41,8 +93,9 @@ module.exports.onedrivecheck = function (parent) {
   // /pluginadmin.ashx?pin=onedrivecheck&whoami=1
   // /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<nodeId>[&id=...]
   // /pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js
-  obj.handleAdminReq = function(req, res, user) {
+  obj.handleAdminReq = async function(req, res, user) {
     try {
+      // include UI
       if (req.query.include == 1) {
         const file = String(req.query.path||"").replace(/\\/g,"/").trim();
         if (file !== "ui.js") { res.sendStatus(404); return; }
@@ -67,8 +120,21 @@ module.exports.onedrivecheck = function (parent) {
         let ids = req.query.id;
         if (!ids) { res.json({}); return; }
         if (!Array.isArray(ids)) ids = [ids];
+
         const out = {};
-        ids.forEach((id)=>{ out[id] = mockStatusFor(id); });
+        // limit concurrency a bit
+        const queue = ids.slice();
+        const MAX_PAR = 5;
+        async function worker(){
+          while(queue.length){
+            const id = queue.shift();
+            try { out[id] = await getStatusFor(id); }
+            catch(e){ err(e); out[id] = { status:"Offline", port20707:false, port20773:false }; }
+          }
+        }
+        const workers = Array.from({length: Math.min(MAX_PAR, ids.length)}, worker);
+        await Promise.all(workers);
+
         res.json(out);
         return;
       }
@@ -79,26 +145,17 @@ module.exports.onedrivecheck = function (parent) {
     }
   };
 
-  function briefHeaders(req){
-    const h = (req && req.headers) || {};
-    const keep = ["host","user-agent","x-forwarded-for","x-forwarded-proto","x-forwarded-host","cf-ray","accept"];
-    const o = {}; keep.forEach(k=>{ if(h[k]) o[k]=h[k]; });
-    o.cookieLength = (h.cookie||"").length;
-    return o;
-  }
-
-  // Inject our UI on every page load
+  // Inject UI script everywhere
   obj.onWebUIStartupEnd = function () {
-    const v = (Date.now() % 1e6); // light cache-buster
+    const v = (Date.now() % 1e6);
     return `<script src="/pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js&v=${v}"></script>`;
   };
 
-  // --------- Client JS (robust selectors + observers)
+  // --------- Client JS (column + device pill; robust selectors/observers)
   function buildClientJS(){
     return `(function(){
   "use strict";
 
-  // ===== utilities =====
   function badge(){
     var bar = document.getElementById('deviceToolbar') ||
               document.querySelector('.DeviceToolbar') ||
@@ -212,38 +269,26 @@ module.exports.onedrivecheck = function (parent) {
     apiStatus([id]).then(paintDevice);
   }
 
-  // ===== observers & triggers =====
-  function onNav(){
-    setTimeout(function(){ badge(); tickList(); tickDevice(); }, 250);
-  }
-
-  // SPA hash navigation
+  function onNav(){ setTimeout(function(){ badge(); tickList(); tickDevice(); }, 250); }
   window.addEventListener('hashchange', onNav);
 
-  // DOM lifecycle
   document.addEventListener('DOMContentLoaded', function(){
     onNav();
-    // Watch table area for redraws
     var root = document.getElementById('Content') || document.body;
     try {
-      var mo = new MutationObserver(function(){
-        // When rows change, repaint quickly
-        tickList();
-      });
+      var mo = new MutationObserver(function(){ tickList(); });
       mo.observe(root, { childList:true, subtree:true });
     } catch (e) {}
   });
 
-  // gentle keep-alive
   setInterval(function(){
     badge();
     if (table() && !document.getElementById('col_onedrivecheck')) tickList();
-    // device page can change without hash sometimes
     tickDevice();
   }, 6000);
 })();`;
   }
 
-  log("onedrivecheck loaded (pluginadmin-only UI; robust DOM hooks)");
+  log("onedrivecheck loaded (pluginadmin-only UI; LIVE checks with caching)");
   return obj;
 };
