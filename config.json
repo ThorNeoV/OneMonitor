@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "author": "Thorsten Klingelhoeffer",
   "description": "Monitors OneDriveCheckService, restarts if offline, shows status in device view.",
-  "hasAdminPanel": true,
+  "hasAdminPanel": false,
   "homepage": "https://github.com/ThorNeoV/OneMonitor",
   "changelogUrl": "https://github.com/ThorNeoV/OneMonitor/blob/main/README.md",
   "configUrl": "https://github.com/ThorNeoV/OneMonitor/blob/main/config.json",
@@ -14,5 +14,5 @@
     "url": "}https://github.com/ThorNeoV/OneMonitor.git"
   },
   "meshCentralCompat": ">=1.0.0"
-
 }
+
