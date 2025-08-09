@@ -1,253 +1,188 @@
-// OneDriveCheckService Monitor for MeshCentral
-// shortName: onedrivecheck
-//
-// Robust plugin that attaches HTTP routes ONLY AFTER Mesh adds cookie-session,
-// so req.user is available. Also injects a CSP-safe UI script and polls devices.
+/** OneDriveCheckService Monitor (devtools-style plugin)
+ * shortName: onedrivecheck
+ * Minimal plugin that:
+ *  - Exports module.exports.onedrivecheck = function(parent) { ... }
+ *  - Attaches routes AFTER Mesh adds cookie-session (so req.user is present)
+ *  - Injects CSP-safe UI via /plugin/onedrivecheck/ui.js
+ */
 
-module.exports = function (parent, toolkit, config) {
-  const plugin = this;
+"use strict";
 
-  // ---------- Basics ----------
-  const fs = require('fs');
-  const path = require('path');
-  const plugindir = (config && config.__plugindir) ? config.__plugindir : __dirname;
+module.exports.onedrivecheck = function (parent) {
+  const obj = {};
+  obj.parent = parent;
+  obj.meshServer = parent.parent;          // same as devtools sample
+  const ws = parent.webserver;             // webserver object
+  const app = (ws && ws.app && typeof ws.app.get === "function") ? ws.app : null;
 
-  // Toggle this to false if you want to test routes without being admin.
-  const REQUIRE_ADMIN = true;
+  // --- logging helpers ------------------------------------------------------
+  function logInfo(m){ try { obj.meshServer.info("onedrivecheck: " + m); } catch{} }
+  function logDbg(m){ try { obj.meshServer.debug("onedrivecheck: " + m); } catch{} }
+  function logErr(e){ try { obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); } catch{} }
 
-  // ---------- Logging helpers ----------
-  function logInfo(msg) { try { parent.info(`onedrivecheck: ${msg}`); } catch {} }
-  function logDebug(msg) { try { parent.debug(`onedrivecheck: ${msg}`); } catch {} }
-  function logError(err) { try { parent.debug('onedrivecheck error: ' + (err && err.stack || err)); } catch {} }
+  // --- webRoot helpers ------------------------------------------------------
+  const webRoot = (ws && ws.webRoot) || "/";
+  const baseNoSlash = webRoot.endsWith("/") ? webRoot.slice(0, -1) : webRoot;
+  const R = (p) => baseNoSlash + p;
 
-  // ---------- Storage (toolkit.config or file fallback) ----------
-  const fileStore = {
-    _read(name) { try { return JSON.parse(fs.readFileSync(path.join(plugindir, name), 'utf8')); } catch { return null; } },
-    _write(name, obj) { try { fs.writeFileSync(path.join(plugindir, name), JSON.stringify(obj || {}, null, 2)); } catch (e) { logError(e); } },
-    get(key, cb) {
-      if (key === 'settings') return cb(this._read('settings.json') || null);
-      if (key.startsWith('status:')) { const all = this._read('statuses.json') || {}; return cb(all[key] || null); }
-      cb(null);
-    },
-    set(key, val, cb) {
-      if (key === 'settings') this._write('settings.json', val || {});
-      else if (key.startsWith('status:')) { const all = this._read('statuses.json') || {}; all[key] = val || null; this._write('statuses.json', all); }
-      cb && cb();
-    }
-  };
-  const store = (toolkit && toolkit.config) ? toolkit.config : fileStore;
+  // --- simple file-backed storage (settings + per-node statuses) ------------
+  const fs = require("fs");
+  const path = require("path");
+  const plugindir = __dirname;
+  function readJson(name){ try { return JSON.parse(fs.readFileSync(path.join(plugindir, name), "utf8")); } catch { return null; } }
+  function writeJson(name, v){ try { fs.writeFileSync(path.join(plugindir, name), JSON.stringify(v||{},null,2)); } catch(e){ logErr(e);} }
 
-  // ---------- Settings & per-device status ----------
   let settings = { meshId: null, pollInterval: 60 }; // seconds
   let pollTimer = null;
-
+  const statusesFile = "statuses.json";
   const statusKey = (id) => `status:${id}`;
-  function saveStatus(deviceId, obj, cb) {
-    try { obj = obj || {}; obj.lastChecked = Date.now(); } catch {}
-    store.set(statusKey(deviceId), obj, () => cb && cb());
-  }
-  function getStatus(deviceId, cb) { store.get(statusKey(deviceId), (v) => cb && cb(v || null)); }
+  function getStatus(id){ const all = readJson(statusesFile) || {}; return all[statusKey(id)] || null; }
+  function setStatus(id, val){ const all = readJson(statusesFile) || {}; all[statusKey(id)] = Object.assign({ lastChecked: Date.now() }, val||{}); writeJson(statusesFile, all); }
 
-  // ---------- Startup ----------
-  plugin.server_startup = function () {
-    logInfo('server_startup');
-    store.get('settings', function (val) {
-      if (val) settings = Object.assign(settings, val);
-      logInfo('settings=' + JSON.stringify(settings));
-      schedulePolling(true);
+  // Load settings once at startup
+  (function loadSettings(){
+    const s = readJson("settings.json");
+    if (s) settings = Object.assign(settings, s);
+    logInfo("settings=" + JSON.stringify(settings));
+  })();
+
+  // --- req.user checker -----------------------------------------------------
+  function isAdmin(req){
+    if (!req || !req.user) return false;
+    const u = req.user;
+    return !!(u.siteadmin || u.domainadmin || u.admin || u.isadmin || u.superuser || ((u.siteadmin|0) !== 0));
+  }
+
+  // --- attach routes AFTER cookie-session is present ------------------------
+  function appHasSession(a){
+    try {
+      if (!a || !a._router || !Array.isArray(a._router.stack)) return false;
+      return a._router.stack.some((layer) => {
+        const n = (layer && (layer.name || (layer.handle && layer.handle.name))) || "";
+        return /session|cookie/i.test(n);
+      });
+    } catch { return false; }
+  }
+
+  function attachRoutes(){
+    // Debug route (helps verify req.user)
+    app.get(R("/plugin/onedrivecheck/debug"), function(req,res){
+      res.json({
+        webRoot, url: req.originalUrl || req.url,
+        hasUser: !!(req && req.user),
+        hasSession: !!(req && req.session),
+        cookiesHeaderPresent: !!(req && req.headers && req.headers.cookie),
+        cookieLen: req && req.headers && req.headers.cookie ? req.headers.cookie.length : 0
+      });
     });
-  };
 
-  function schedulePolling(forceRunNow) {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    if (!settings.meshId) { logInfo('no meshId set; not polling'); return; }
-    const intervalMs = Math.max(10, parseInt(settings.pollInterval || 60, 10)) * 1000;
-    logInfo('polling every ' + (intervalMs / 1000) + 's');
-    pollTimer = setInterval(pollDevices, intervalMs);
-    if (forceRunNow) pollDevices();
-  }
+    // Who am I
+    app.get(R("/plugin/onedrivecheck/whoami"), function(req,res){
+      if (!req || !req.user) { res.status(401).json({ ok:false, reason:"no user" }); return; }
+      const { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } = req.user;
+      res.json({ ok:true, user:{ name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } });
+    });
 
-  // ---------- Admin HTML ----------
-  function adminHtml() {
-    const meshIdVal = settings.meshId ? String(settings.meshId) : '';
-    const pollVal = String(settings.pollInterval || 60);
-    return `<!doctype html>
+    // Admin UI
+    app.get(R("/plugin/onedrivecheck/admin"), function(req,res){
+      if (!isAdmin(req)) { res.status(403).end("Forbidden"); return; }
+      const html = `<!doctype html>
 <html><head><meta charset="utf-8"><title>OneDriveCheckService Monitor</title></head>
 <body style="font-family:sans-serif; padding:20px; max-width:860px;">
   <h2>OneDriveCheckService Monitor — Settings</h2>
-  <form method="POST" action="__ADMIN_POST__">
+  <form method="POST" action="${R('/plugin/onedrivecheck/admin')}">
     <label><strong>Mesh Group ID (meshId)</strong></label><br/>
-    <input type="text" name="meshId" value="${meshIdVal}" required style="width:420px" /><br/><br/>
+    <input type="text" name="meshId" value="${settings.meshId ? String(settings.meshId) : ''}" required style="width:420px" /><br/><br/>
     <label><strong>Polling Interval</strong> (seconds, min 10)</label><br/>
-    <input type="number" min="10" name="pollInterval" value="${pollVal}" style="width:120px"/><br/><br/>
+    <input type="number" min="10" name="pollInterval" value="${String(settings.pollInterval || 60)}" style="width:120px"/><br/><br/>
     <input type="submit" value="Save" />
   </form>
   <p style="margin-top:14px;color:#555">Tip: Groups → Info shows the meshId.</p>
 </body></html>`;
-  }
+      res.setHeader("Content-Type","text/html; charset=utf-8");
+      res.end(html);
+    });
 
-  // ---------- Express helpers ----------
-  function resolveExpressLib(expressArg) {
-    try {
-      if (expressArg && typeof expressArg.urlencoded === 'function') return expressArg;
-      if (parent && parent.webserver && parent.webserver.express && typeof parent.webserver.express.urlencoded === 'function') return parent.webserver.express;
-      const e = require('express'); if (e && typeof e.urlencoded === 'function') return e;
-    } catch {}
-    return null;
-  }
-  function manualUrlencoded() {
-    return function (req, res, next) {
-      if (req.method !== 'POST') return next();
-      const ctype = (req.headers['content-type'] || '').toLowerCase();
-      if (ctype.indexOf('application/x-www-form-urlencoded') === -1) return next();
-      let data = '';
-      req.on('data', (d) => { data += d; if (data.length > 1e6) req.destroy(); });
-      req.on('end', () => {
+    // urlencoded fallback (no express dependency)
+    function manualUrlencoded(req,res,next){
+      if (req.method !== "POST") return next();
+      const ctype = (req.headers["content-type"]||"").toLowerCase();
+      if (!ctype.includes("application/x-www-form-urlencoded")) return next();
+      let data = "";
+      req.on("data",(d)=>{ data += d; if (data.length > 1e6) req.destroy(); });
+      req.on("end", ()=>{
         const body = {};
-        data.split('&').forEach(p => {
+        data.split("&").forEach(p=>{
           if (!p) return;
-          const eq = p.indexOf('=');
-          const k = decodeURIComponent((eq === -1 ? p : p.substring(0, eq)).replace(/\+/g, ' '));
-          const v = decodeURIComponent((eq === -1 ? '' : p.substring(eq + 1)).replace(/\+/g, ' '));
-          if (k) body[k] = v;
+          const eq = p.indexOf("=");
+          const k = decodeURIComponent((eq===-1?p:p.slice(0,eq)).replace(/\+/g," "));
+          const v = decodeURIComponent((eq===-1?"":p.slice(eq+1)).replace(/\+/g," "));
+          if (k) body[k]=v;
         });
         req.body = body; next();
       });
-    };
-  }
-  function isAdminReq(req) {
-    if (!REQUIRE_ADMIN) return true;
-    if (!req || !req.user) return false;
-    const u = req.user;
-    return !!(u.siteadmin || u.domainadmin || u.admin || u.isadmin || u.superuser);
-  }
-
-  // ---------- Attach routes AFTER cookie-session is present ----------
-  plugin.hook_setupHttpHandlers = function (_appOrWeb, expressArg) {
-    const ws = parent && parent.webserver;
-    const app = (ws && ws.app && typeof ws.app.get === 'function') ? ws.app : null;
-    if (!app) { logError('post-auth express app not found'); return; }
-
-    // Paths respect webRoot
-    const webRoot = (ws && ws.webRoot) || '/';
-    const baseNoSlash = webRoot.endsWith('/') ? webRoot.slice(0, -1) : webRoot;
-    function R(p) { return baseNoSlash + p; }
-
-    const expressLib = resolveExpressLib(expressArg);
-    const urlenc = expressLib ? expressLib.urlencoded({ extended: true }) : manualUrlencoded();
-
-    // We'll attach our routes only after cookie-session middleware exists,
-    // so req.user/req.session are available.
-    function appHasSession(a) {
-      try {
-        if (!a || !a._router || !Array.isArray(a._router.stack)) return false;
-        return a._router.stack.some(layer =>
-          (layer && layer.name && /session|cookie|cookies|cookieSession/i.test(layer.name)) ||
-          (layer && layer.handle && layer.handle.name && /session|cookie/i.test(layer.handle.name))
-        );
-      } catch { return false; }
     }
 
-    let attached = false;
-    function attachRoutes() {
-      if (attached) return;
-      attached = true;
+    app.post(R("/plugin/onedrivecheck/admin"), manualUrlencoded, function(req,res){
+      if (!isAdmin(req)) { res.status(403).end("Forbidden"); return; }
+      if (req.body && typeof req.body.meshId === "string") settings.meshId = req.body.meshId.trim();
+      if (req.body && req.body.pollInterval) settings.pollInterval = Math.max(10, parseInt(req.body.pollInterval,10) || 60);
+      writeJson("settings.json", settings);
+      logInfo("settings saved: " + JSON.stringify(settings));
+      schedulePolling(true);
+      res.writeHead(302, { Location: R("/plugin/onedrivecheck/admin") });
+      res.end();
+    });
 
-      // Debug route: see if req.user exists
-      app.get(R('/plugin/onedrivecheck/debug'), function (req, res) {
-        res.json({
-          appId: (app && app._router ? ('app@' + (app._router.stack ? app._router.stack.length : 'x')) : 'app'),
-          webRoot,
-          url: req.originalUrl || req.url,
-          hasUser: !!(req && req.user),
-          hasSession: !!(req && req.session),
-          cookiesHeaderPresent: !!(req && req.headers && req.headers.cookie),
-          cookieLen: req && req.headers && req.headers.cookie ? req.headers.cookie.length : 0
-        });
-      });
+    // Status API
+    app.get(R("/plugin/onedrivecheck/status"), function(req,res){
+      if (!isAdmin(req)) { res.status(403).end("Forbidden"); return; }
+      let ids = req.query.id;
+      if (!ids) { res.json({}); return; }
+      if (!Array.isArray(ids)) ids = [ids];
+      const out = {};
+      ids.forEach((id)=>{ out[id] = getStatus(id); });
+      res.json(out);
+    });
 
-      // whoami
-      app.get(R('/plugin/onedrivecheck/whoami'), function (req, res) {
-        if (!req || !req.user) { res.status(401).json({ ok: false, reason: 'no user' }); return; }
-        const { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } = req.user;
-        res.json({ ok: true, user: { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } });
-      });
-
-      // Admin UI
-      app.get(R('/plugin/onedrivecheck/admin'), function (req, res) {
-        if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        const html = adminHtml().replace('__ADMIN_POST__', R('/plugin/onedrivecheck/admin'));
-        res.end(html);
-      });
-
-      app.post(R('/plugin/onedrivecheck/admin'), urlenc, function (req, res) {
-        if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
-        if (req.body && typeof req.body.meshId === 'string') settings.meshId = req.body.meshId.trim();
-        if (req.body && req.body.pollInterval) settings.pollInterval = Math.max(10, parseInt(req.body.pollInterval, 10) || 60);
-        store.set('settings', settings, function () {
-          logInfo('settings saved: ' + JSON.stringify(settings));
-          schedulePolling(true);
-          res.writeHead(302, { Location: R('/plugin/onedrivecheck/admin') });
-          res.end();
-        });
-      });
-
-      // Status API
-      app.get(R('/plugin/onedrivecheck/status'), function (req, res) {
-        if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
-        let ids = req.query.id;
-        if (!ids) { res.json({}); return; }
-        if (!Array.isArray(ids)) ids = [ids];
-        const out = {};
-        let pending = ids.length;
-        ids.forEach((id) => {
-          getStatus(id, function (v) {
-            out[id] = v;
-            if (--pending === 0) res.json(out);
-          });
-        });
-      });
-
-      // UI JS (public)
-      app.get(R('/plugin/onedrivecheck/ui.js'), function (req, res) {
-        const js = String.raw`(function(){
-  function queryDevicesTable(){ return document.querySelector('#devices, #devicesTable'); }
-  function getRowDeviceId(row){
+    // UI JS (public, CSP-safe)
+    app.get(R("/plugin/onedrivecheck/ui.js"), function(req,res){
+      const js = String.raw`(function(){
+  function qTable(){ return document.querySelector('#devices, #devicesTable'); }
+  function getRowId(row){
     return row.getAttribute('deviceid') || row.dataset.deviceid ||
            (row.id && row.id.startsWith('d_') ? row.id.substring(2) : null) ||
            row.getAttribute('nodeid') || row.dataset.nodeid || null;
   }
-  function addColumnHeader(){
-    var grid = queryDevicesTable(); if(!grid) return false;
-    var thead = grid.querySelector('thead'); if(!thead) return false;
-    var tr = thead.querySelector('tr'); if(!tr) return false;
+  function addHeader(){
+    var g=qTable(); if(!g) return false;
+    var thead=g.querySelector('thead'); if(!thead) return false;
+    var tr=thead.querySelector('tr'); if(!tr) return false;
     if(!document.getElementById('col_onedrivecheck')){
-      var th = document.createElement('th'); th.id='col_onedrivecheck'; th.textContent='OneDriveCheck'; tr.appendChild(th);
+      var th=document.createElement('th'); th.id='col_onedrivecheck'; th.textContent='OneDriveCheck'; tr.appendChild(th);
     }
     return true;
   }
   function ensureCells(){
-    var grid = queryDevicesTable(); if(!grid) return [];
-    var rows = grid.querySelectorAll('tbody tr'); var ids = [];
-    rows.forEach(function(row){
-      if(!row.querySelector('.onedrivecheck-cell')){
-        var td = document.createElement('td'); td.className='onedrivecheck-cell'; td.textContent='—'; row.appendChild(td);
+    var g=qTable(); if(!g) return [];
+    var rows=g.querySelectorAll('tbody tr'); var ids=[];
+    rows.forEach(function(r){
+      if(!r.querySelector('.onedrivecheck-cell')){
+        var td=document.createElement('td'); td.className='onedrivecheck-cell'; td.textContent='—'; r.appendChild(td);
       }
-      var id = getRowDeviceId(row); if(id) ids.push(id);
+      var id=getRowId(r); if(id) ids.push(id);
     });
     return ids;
   }
-  function paintRows(statusMap){
-    var grid = queryDevicesTable(); if(!grid) return;
-    var rows = grid.querySelectorAll('tbody tr');
-    rows.forEach(function(row){
-      var id = getRowDeviceId(row);
-      var td = row.querySelector('.onedrivecheck-cell'); if(!td) return;
-      var s = (id && statusMap && statusMap[id]) ? statusMap[id] : null;
+  function paint(map){
+    var g=qTable(); if(!g) return;
+    g.querySelectorAll('tbody tr').forEach(function(r){
+      var id=getRowId(r);
+      var td=r.querySelector('.onedrivecheck-cell'); if(!td) return;
+      var s=(id && map && map[id])?map[id]:null;
       if(!s){ td.textContent='—'; td.dataset.state=''; td.title=''; return; }
       td.textContent = s.status || '—';
-      td.title = '20707:' + (s.port20707 ? 'open' : 'closed') + ', 20773:' + (s.port20773 ? 'open' : 'closed');
+      td.title = '20707:'+(s.port20707?'open':'closed')+', 20773:'+(s.port20773?'open':'closed');
       td.dataset.state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
     });
   }
@@ -256,136 +191,127 @@ module.exports = function (parent, toolkit, config) {
     var url = '${R('/plugin/onedrivecheck/status')}' + '?' + ids.map(function(id){ return 'id='+encodeURIComponent(id); }).join('&');
     return fetch(url, { credentials:'same-origin' }).then(function(r){ return r.json(); }).catch(function(){ return {}; });
   }
-  function applyFilter(){
-    var sel = document.getElementById('filter_onedrivecheck'); if(!sel) return;
-    var mode = sel.value;
-    var grid = queryDevicesTable(); if(!grid) return;
-    var rows = grid.querySelectorAll('tbody tr');
-    rows.forEach(function(r){
-      var td = r.querySelector('.onedrivecheck-cell'); var state = td ? td.dataset.state : '';
-      var show = true;
-      if(mode==='offline')   show = (state==='offline');
-      if(mode==='notsigned') show = (state==='notsigned');
-      if(mode==='online')    show = (state==='online');
-      r.style.display = show ? '' : 'none';
-    });
-  }
-  function addFilterUI(){
-    var bar = document.getElementById('deviceToolbar') || document.querySelector('.DeviceToolbar') || document.querySelector('#Toolbar') || document.querySelector('#devicestoolbar');
+  function addFilter(){
+    var bar=document.getElementById('deviceToolbar')||document.querySelector('.DeviceToolbar')||document.querySelector('#Toolbar')||document.querySelector('#devicestoolbar');
     if(!bar) return; if(document.getElementById('filter_onedrivecheck')) return;
-    var label = document.createElement('span'); label.style.marginLeft='10px'; label.textContent='OneDriveCheck: ';
-    var sel = document.createElement('select'); sel.id='filter_onedrivecheck';
+    var label=document.createElement('span'); label.style.marginLeft='10px'; label.textContent='OneDriveCheck: ';
+    var sel=document.createElement('select'); sel.id='filter_onedrivecheck';
     [{v:'all',t:'All'},{v:'offline',t:'App Offline (20707 closed & 20773 closed)'},{v:'notsigned',t:'Not signed in (20773 open)'},{v:'online',t:'Online (20707 open)'}]
       .forEach(function(o){ var opt=document.createElement('option'); opt.value=o.v; opt.text=o.t; sel.appendChild(opt); });
-    sel.onchange = applyFilter; bar.appendChild(label); bar.appendChild(sel);
-  }
-  function refreshNow(){
-    if(!addColumnHeader()) return;
-    addFilterUI();
-    var ids = ensureCells();
-    fetchStatus(ids).then(function(map){ paintRows(map); applyFilter(); });
-  }
-  document.addEventListener('meshcentralDeviceListRefreshEnd', refreshNow);
-  document.addEventListener('DOMContentLoaded', function(){ setTimeout(refreshNow, 500); });
-  setInterval(function(){
-    var grid = queryDevicesTable();
-    if(grid && !document.getElementById('col_onedrivecheck')) refreshNow();
-  }, 4000);
-})();`;
-        res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
-        res.end(js);
+    sel.onchange=function(){
+      var mode=sel.value, rows=(qTable()||document).querySelectorAll('tbody tr');
+      rows.forEach(function(r){
+        var td=r.querySelector('.onedrivecheck-cell'); var st=td?td.dataset.state:'';
+        var show=true;
+        if(mode==='offline') show=(st==='offline');
+        if(mode==='notsigned') show=(st==='notsigned');
+        if(mode==='online') show=(st==='online');
+        r.style.display=show?'':'none';
       });
+    };
+    bar.appendChild(label); bar.appendChild(sel);
+  }
+  function tick(){
+    if(!addHeader()) return;
+    addFilter();
+    var ids=ensureCells();
+    fetchStatus(ids).then(function(map){ paint(map); });
+  }
+  document.addEventListener('meshcentralDeviceListRefreshEnd', tick);
+  document.addEventListener('DOMContentLoaded', function(){ setTimeout(tick, 500); });
+  setInterval(function(){ var g=qTable(); if(g && !document.getElementById('col_onedrivecheck')) tick(); }, 4000);
+})();`;
+      res.setHeader("Content-Type","application/javascript; charset=utf-8");
+      res.end(js);
+    });
 
-      logInfo('routes attached (after session middleware), webRoot=' + webRoot);
-    }
+    logInfo("routes attached at webRoot=" + webRoot);
+  }
 
-    // Wait until cookie-session is present, then attach.
+  if (!app) {
+    logErr("webserver.app not found; cannot attach routes");
+  } else {
+    // Wait until cookie-session is present so req.user works.
     let tries = 0;
-    (function waitAndAttach() {
+    (function waitForSession(){
       tries++;
       if (appHasSession(app)) { attachRoutes(); return; }
-      if (tries > 60) { // ~60s max
-        logError('session middleware not detected; attaching anyway (req.user may be missing)');
-        attachRoutes();
-        return;
-      }
-      setTimeout(waitAndAttach, 1000);
+      if (tries > 60) { logErr("session middleware not detected; attaching anyway"); attachRoutes(); return; }
+      setTimeout(waitForSession, 1000);
     })();
-  };
+  }
 
-  // ---------- Inject our UI ----------
-  plugin.onWebUIStartupEnd = function () {
-    const ws = parent && parent.webserver;
-    const webRoot = (ws && ws.webRoot) || '/';
-    const base = webRoot.endsWith('/') ? webRoot : (webRoot + '/');
+  // --- Inject UI on page load (Mesh calls this on login/refresh) ------------
+  obj.onWebUIStartupEnd = function () {
+    const base = webRoot.endsWith("/") ? webRoot : (webRoot + "/");
     return `<script src="${base}plugin/onedrivecheck/ui.js"></script>`;
   };
 
-  // ---------- Device enumeration & commands ----------
-  function getDevicesInMesh(meshId) {
-    return new Promise((resolve) => {
-      try {
-        parent.db.GetAllType('node', (nodes) => {
-          const map = {};
-          (nodes || []).forEach((n) => { if (n.meshid === meshId) map[n._id] = n; });
-          resolve(map);
-        });
-      } catch (e) { logError(e); resolve({}); }
-    });
-  }
-
-  function sendShell(deviceId, cmd) {
-    return new Promise((resolve) => {
-      const payload = { cmd: cmd, type: 'powershell' };
-      parent.sendCommand(deviceId, 'shell', payload, function (resp) {
-        resolve(resp && resp.data ? String(resp.data) : '');
+  // --- Polling logic (Windows agents only) ----------------------------------
+  function sendShell(nodeId, cmd){
+    return new Promise((resolve)=>{
+      const payload = { cmd, type: "powershell" };
+      obj.meshServer.sendCommand(nodeId, "shell", payload, function(resp){
+        resolve(resp && resp.data ? String(resp.data) : "");
       });
     });
   }
 
-  async function checkPort(deviceId, port) {
+  async function checkPort(nodeId, port){
     const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "(Test-NetConnection -ComputerName localhost -Port ${port}).TcpTestSucceeded"`;
-    const out = await sendShell(deviceId, cmd);
+    const out = await sendShell(nodeId, cmd);
     return /true/i.test(out);
   }
 
-  async function restartService(deviceId) {
+  async function restartService(nodeId){
     const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Try { Restart-Service -Name OneDriveCheckService -Force -ErrorAction Stop; 'OK' } Catch { 'ERR:' + $_ }"`;
-    await sendShell(deviceId, cmd);
-    logDebug('Restarted OneDriveCheckService on ' + deviceId);
+    await sendShell(nodeId, cmd);
+    logDbg("Restarted OneDriveCheckService on " + nodeId);
   }
 
-  async function pollDevices() {
+  function getDevicesInMesh(meshId){
+    return new Promise((resolve)=>{
+      try {
+        obj.meshServer.db.GetAllType("node", (nodes)=>{
+          const map = {};
+          (nodes||[]).forEach((n)=>{ if (n.meshid === meshId) map[n._id] = n; });
+          resolve(map);
+        });
+      } catch(e){ logErr(e); resolve({}); }
+    });
+  }
+
+  async function poll(){
     try {
       if (!settings.meshId) return;
-      const allDevices = await getDevicesInMesh(settings.meshId);
-      const ids = Object.keys(allDevices || {});
-      for (const nodeId of ids) {
-        const device = allDevices[nodeId];
-        if (!device) continue;
-        const osd = (device.osdesc || '').toLowerCase();
-        if (!osd.includes('windows')) continue;
+      const nodes = await getDevicesInMesh(settings.meshId);
+      for (const nodeId of Object.keys(nodes||{})) {
+        const d = nodes[nodeId];
+        const osd = (d.osdesc||"").toLowerCase();
+        if (!osd.includes("windows")) continue;
 
         const port20707 = await checkPort(nodeId, 20707);
         const port20773 = await checkPort(nodeId, 20773);
-
         const status = {
-          status: (port20707 ? 'App Online' : (port20773 ? 'Not signed in' : 'Offline')),
+          status: (port20707 ? "App Online" : (port20773 ? "Not signed in" : "Offline")),
           port20707: !!port20707,
           port20773: !!port20773
         };
+        setStatus(nodeId, status);
 
-        saveStatus(nodeId, status);
-
-        if (!port20707 && !port20773) {
-          await restartService(nodeId);
-        }
+        if (!port20707 && !port20773) await restartService(nodeId);
       }
-    } catch (err) { logError(err); }
+    } catch(e){ logErr(e); }
   }
 
-  return plugin;
-};
+  function schedulePolling(runNow){
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (!settings.meshId) { logInfo("no meshId set; not polling"); return; }
+    const ms = Math.max(10, parseInt(settings.pollInterval||60,10))*1000;
+    pollTimer = setInterval(poll, ms);
+    if (runNow) poll();
+  }
+  schedulePolling(true); // start if meshId already set
 
-// Also expose a named export for builds that call require(...)[shortName](...)
-module.exports.onedrivecheck = module.exports;
+  return obj;
+};
