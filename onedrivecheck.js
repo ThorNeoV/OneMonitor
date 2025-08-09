@@ -274,3 +274,4 @@ module.exports = function(parent, toolkit, config) {
 
   return plugin;
 };
+module.exports.onedrivecheck = module.exports;
