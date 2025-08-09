@@ -149,28 +149,30 @@ module.exports = function(parent, toolkit, config) {
     // cover a bunch of flags MeshCentral builds use
     return !!(u.siteadmin || u.domainadmin || u.admin || u.isadmin || u.superuser);
   }
+
+
   // ---------- HTTP Handlers ----------
   plugin.hook_setupHttpHandlers = function(appOrWeb, expressArg) {
     const app = resolveExpressApp(appOrWeb);
-    
+    if (!app) { logError('could not resolve express app'); return; }
+  
+    const expressLib = resolveExpressLib(expressArg);
+    const urlenc = expressLib ? expressLib.urlencoded({ extended: true }) : manualUrlencoded();
+  
+    // Debug: whoami (optional; remove later)
     app.get('/plugin/onedrivecheck/whoami', function(req, res) {
       if (!req || !req.user) { res.status(401).json({ ok:false, reason:'no user' }); return; }
       const { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } = req.user;
       res.json({ ok:true, user:{ name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } });
     });
-    
-    if (!app) { logError('could not resolve express app'); return; }
-
-    const expressLib = resolveExpressLib(expressArg);
-    const urlenc = expressLib ? expressLib.urlencoded({ extended: true }) : manualUrlencoded();
-
+  
     // Admin UI
     app.get('/plugin/onedrivecheck/admin', function(req, res) {
       if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.end(adminHtml());
     });
-
+  
     app.post('/plugin/onedrivecheck/admin', urlenc, function(req, res) {
       if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
       if (req.body && typeof req.body.meshId === 'string') settings.meshId = req.body.meshId.trim();
@@ -182,7 +184,7 @@ module.exports = function(parent, toolkit, config) {
         res.end();
       });
     });
-
+  
     // Status API
     app.get('/plugin/onedrivecheck/status', function(req, res) {
       if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
@@ -198,11 +200,10 @@ module.exports = function(parent, toolkit, config) {
         });
       });
     });
-
-
+  
     // UI JS (CSP-safe) — PUBLIC
     app.get('/plugin/onedrivecheck/ui.js', function(req, res) {
-      const js = '(function(){
+      const js = String.raw`(function(){
         function queryDevicesTable(){ return document.querySelector('#devices, #devicesTable'); }
         function getRowDeviceId(row){
           return row.getAttribute('deviceid') || row.dataset.deviceid ||
@@ -282,12 +283,12 @@ module.exports = function(parent, toolkit, config) {
           var grid = queryDevicesTable();
           if(grid && !document.getElementById('col_onedrivecheck')) refreshNow();
         }, 4000);
-      })();';
+      })();`;
       res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
       res.end(js);
     });
   };
-
+    
   // ---------- UI loader ----------
   plugin.onWebUIStartupEnd = function() {
     return `<script src="/plugin/onedrivecheck/ui.js"></script>`;
@@ -362,4 +363,5 @@ module.exports = function(parent, toolkit, config) {
 
 // Also expose a named export for builds that call require(...)[shortName](...)
 module.exports.onedrivecheck = module.exports;
+
 
