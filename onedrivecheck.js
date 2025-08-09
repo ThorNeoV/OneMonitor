@@ -5,7 +5,7 @@
 // - Uses toolkit.config if present, else falls back to files in the plugin dir
 // - Resolves the real Express app (or gracefully degrades)
 // - Provides both default export and named export (exports.onedrivecheck)
-// - Loads UI as external /plugin/onedrivecheck/ui.js (CSP safe)
+// - Loads UI as external /plugin/onedrivecheck/ui.js (CSP safe) and prefixes with webRoot
 
 module.exports = function(parent, toolkit, config) {
   const plugin = this;
@@ -92,7 +92,7 @@ module.exports = function(parent, toolkit, config) {
 <html><head><meta charset="utf-8"><title>OneDriveCheckService Monitor</title></head>
 <body style="font-family:sans-serif; padding:20px; max-width:860px;">
   <h2>OneDriveCheckService Monitor — Settings</h2>
-  <form method="POST" action="/plugin/onedrivecheck/admin">
+  <form method="POST" action="__ADMIN_POST__">
     <label><strong>Mesh Group ID (meshId)</strong></label><br/>
     <input type="text" name="meshId" value="${meshIdVal}" required style="width:420px" /><br/><br/>
     <label><strong>Polling Interval</strong> (seconds, min 10)</label><br/>
@@ -150,43 +150,49 @@ module.exports = function(parent, toolkit, config) {
     return !!(u.siteadmin || u.domainadmin || u.admin || u.isadmin || u.superuser);
   }
 
-
   // ---------- HTTP Handlers ----------
   plugin.hook_setupHttpHandlers = function(appOrWeb, expressArg) {
     const app = resolveExpressApp(appOrWeb);
     if (!app) { logError('could not resolve express app'); return; }
-  
+
+    // Use Mesh webRoot so routes live under the same path/cookies as the UI
+    const webRoot = (parent && parent.webserver && parent.webserver.webRoot) || '/';
+    const baseNoSlash = webRoot.endsWith('/') ? webRoot.slice(0, -1) : webRoot;
+    function R(p) { return baseNoSlash + p; } // e.g. "/meshroot" + "/plugin/..."
+
     const expressLib = resolveExpressLib(expressArg);
     const urlenc = expressLib ? expressLib.urlencoded({ extended: true }) : manualUrlencoded();
-  
+
     // Debug: whoami (optional; remove later)
-    app.get('/plugin/onedrivecheck/whoami', function(req, res) {
+    app.get(R('/plugin/onedrivecheck/whoami'), function(req, res) {
       if (!req || !req.user) { res.status(401).json({ ok:false, reason:'no user' }); return; }
       const { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } = req.user;
       res.json({ ok:true, user:{ name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } });
     });
-  
+
     // Admin UI
-    app.get('/plugin/onedrivecheck/admin', function(req, res) {
+    app.get(R('/plugin/onedrivecheck/admin'), function(req, res) {
       if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end(adminHtml());
+      // patch the form action to include webRoot
+      const html = adminHtml().replace('__ADMIN_POST__', R('/plugin/onedrivecheck/admin'));
+      res.end(html);
     });
-  
-    app.post('/plugin/onedrivecheck/admin', urlenc, function(req, res) {
+
+    app.post(R('/plugin/onedrivecheck/admin'), urlenc, function(req, res) {
       if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
       if (req.body && typeof req.body.meshId === 'string') settings.meshId = req.body.meshId.trim();
       if (req.body && req.body.pollInterval) settings.pollInterval = Math.max(10, parseInt(req.body.pollInterval, 10) || 60);
       store.set('settings', settings, function() {
         logInfo('settings saved: ' + JSON.stringify(settings));
         schedulePolling(true);
-        res.writeHead(302, { Location: '/plugin/onedrivecheck/admin' });
+        res.writeHead(302, { Location: R('/plugin/onedrivecheck/admin') });
         res.end();
       });
     });
-  
+
     // Status API
-    app.get('/plugin/onedrivecheck/status', function(req, res) {
+    app.get(R('/plugin/onedrivecheck/status'), function(req, res) {
       if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
       let ids = req.query.id;
       if (!ids) { res.json({}); return; }
@@ -200,9 +206,9 @@ module.exports = function(parent, toolkit, config) {
         });
       });
     });
-  
+
     // UI JS (CSP-safe) — PUBLIC
-    app.get('/plugin/onedrivecheck/ui.js', function(req, res) {
+    app.get(R('/plugin/onedrivecheck/ui.js'), function(req, res) {
       const js = String.raw`(function(){
         function queryDevicesTable(){ return document.querySelector('#devices, #devicesTable'); }
         function getRowDeviceId(row){
@@ -245,7 +251,7 @@ module.exports = function(parent, toolkit, config) {
         }
         function fetchStatus(ids){
           if(!ids || ids.length===0) return Promise.resolve({});
-          var url = '/plugin/onedrivecheck/status?' + ids.map(function(id){ return 'id='+encodeURIComponent(id); }).join('&');
+          var url = '${R('/plugin/onedrivecheck/status')}' + '?' + ids.map(function(id){ return 'id='+encodeURIComponent(id); }).join('&');
           return fetch(url, { credentials:'same-origin' }).then(function(r){ return r.json(); }).catch(function(){ return {}; });
         }
         function applyFilter(){
@@ -288,10 +294,12 @@ module.exports = function(parent, toolkit, config) {
       res.end(js);
     });
   };
-    
+
   // ---------- UI loader ----------
   plugin.onWebUIStartupEnd = function() {
-    return `<script src="/plugin/onedrivecheck/ui.js"></script>`;
+    const webRoot = (parent && parent.webserver && parent.webserver.webRoot) || '/';
+    const base = webRoot.endsWith('/') ? webRoot : (webRoot + '/');
+    return `<script src="${base}plugin/onedrivecheck/ui.js"></script>`;
   };
 
   // ---------- Device enumeration & shell ----------
@@ -363,5 +371,3 @@ module.exports = function(parent, toolkit, config) {
 
 // Also expose a named export for builds that call require(...)[shortName](...)
 module.exports.onedrivecheck = module.exports;
-
-
