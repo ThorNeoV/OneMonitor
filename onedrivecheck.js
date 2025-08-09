@@ -6,11 +6,10 @@ module.exports.onedrivecheck = function (parent) {
   obj.parent = parent;
   obj.meshServer = parent.parent;
 
-  // logging
   const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{ console.log("onedrivecheck:", m); } };
   const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{ console.error("onedrivecheck error:", e); } };
 
-  // tiny file store for mock status (replace later with real checks if you want)
+  // tiny persisted map (mock status until you hook real checks)
   const fs = require("fs");
   const path = require("path");
   const statusFile = path.join(__dirname, "statuses.json");
@@ -37,15 +36,13 @@ module.exports.onedrivecheck = function (parent) {
     return { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser };
   }
 
-  // -------- ADMIN BRIDGE (authenticated on your setup)
-  // URLs:
-  //   /pluginadmin.ashx?pin=onedrivecheck&debug=1
-  //   /pluginadmin.ashx?pin=onedrivecheck&whoami=1
-  //   /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<nodeId>[&id=...]
-  //   /pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js
+  // ========== AUTHENTICATED BRIDGE ==========
+  // /pluginadmin.ashx?pin=onedrivecheck&debug=1
+  // /pluginadmin.ashx?pin=onedrivecheck&whoami=1
+  // /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<nodeId>[&id=...]
+  // /pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js
   obj.handleAdminReq = function(req, res, user) {
     try {
-      // serve UI script
       if (req.query.include == 1) {
         const file = String(req.query.path||"").replace(/\\/g,"/").trim();
         if (file !== "ui.js") { res.sendStatus(404); return; }
@@ -55,7 +52,7 @@ module.exports.onedrivecheck = function (parent) {
       }
 
       if (req.query.debug == 1) {
-        res.json({ ok:true, via:"handleAdminReq", hasUser:!!user, user:summarizeUser(user), hasSession:!!req.session, headers: headerBrief(req) });
+        res.json({ ok:true, via:"handleAdminReq", hasUser:!!user, user:summarizeUser(user), hasSession:!!(req && req.session), headers: briefHeaders(req) });
         return;
       }
 
@@ -82,35 +79,39 @@ module.exports.onedrivecheck = function (parent) {
     }
   };
 
-  function headerBrief(req){
-    const h = req && req.headers || {};
-    const keep = ["host","cookie","user-agent","x-forwarded-for","x-forwarded-proto","x-forwarded-host","cf-ray","cf-visitor","accept"];
+  function briefHeaders(req){
+    const h = (req && req.headers) || {};
+    const keep = ["host","user-agent","x-forwarded-for","x-forwarded-proto","x-forwarded-host","cf-ray","accept"];
     const o = {}; keep.forEach(k=>{ if(h[k]) o[k]=h[k]; });
     o.cookieLength = (h.cookie||"").length;
     return o;
   }
 
-  // Inject our UI
+  // Inject our UI on every page load
   obj.onWebUIStartupEnd = function () {
-    // cache-bust lightly so updates show up
-    const t = Date.now() % 100000;
-    return `<script src="/pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js&v=${t}"></script>`;
+    const v = (Date.now() % 1e6); // light cache-buster
+    return `<script src="/pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js&v=${v}"></script>`;
   };
 
-  // ---- client code
+  // --------- Client JS (robust selectors + observers)
   function buildClientJS(){
     return `(function(){
   "use strict";
 
-  // small toolbar badge so you can see it's loaded
+  // ===== utilities =====
   function badge(){
-    var bar = document.getElementById('deviceToolbar') || document.querySelector('.DeviceToolbar') || document.querySelector('#Toolbar') || document.querySelector('#devicestoolbar') || document.querySelector('.TopBar');
-    if(!bar) return;
-    if(document.getElementById('odc-badge')) return;
+    var bar = document.getElementById('deviceToolbar') ||
+              document.querySelector('.DeviceToolbar') ||
+              document.querySelector('#Toolbar') ||
+              document.querySelector('#devicestoolbar') ||
+              document.querySelector('.TopBar');
+    if(!bar || document.getElementById('odc-badge')) return;
     var b=document.createElement('span');
     b.id='odc-badge';
     b.textContent='ODC';
-    b.style.marginLeft='8px'; b.style.padding='2px 6px'; b.style.border='1px solid #999'; b.style.borderRadius='6px'; b.style.fontWeight='600'; b.style.fontSize='12px';
+    b.style.marginLeft='8px'; b.style.padding='2px 6px';
+    b.style.border='1px solid #999'; b.style.borderRadius='6px';
+    b.style.fontWeight='600'; b.style.fontSize='12px';
     bar.appendChild(b);
   }
 
@@ -120,27 +121,38 @@ module.exports.onedrivecheck = function (parent) {
   }
 
   // ===== Device List =====
-  function table(){ return document.querySelector('#devices, #devicesTable'); }
+  function table(){
+    return document.querySelector('#devices') ||
+           document.querySelector('#devicesTable') ||
+           document.querySelector('table#devicetable') ||
+           document.querySelector('table[data-list="devices"]');
+  }
   function rowId(row){
     return row.getAttribute('deviceid') || row.dataset.deviceid ||
+           row.getAttribute('nodeid')   || row.dataset.nodeid   ||
            (row.id && row.id.startsWith('d_') ? row.id.substring(2) : null) ||
-           row.getAttribute('nodeid') || row.dataset.nodeid || null;
+           null;
   }
   function addHeader(){
     var g=table(); if(!g) return false;
     var thead=g.querySelector('thead'); if(!thead) return false;
     var tr=thead.querySelector('tr'); if(!tr) return false;
     if(!document.getElementById('col_onedrivecheck')){
-      var th=document.createElement('th'); th.id='col_onedrivecheck'; th.textContent='OneDriveCheck'; tr.appendChild(th);
+      var th=document.createElement('th'); th.id='col_onedrivecheck'; th.textContent='OneDriveCheck';
+      th.style.whiteSpace='nowrap';
+      tr.appendChild(th);
     }
     return true;
   }
   function ensureCells(){
     var g=table(); if(!g) return [];
-    var rows=g.querySelectorAll('tbody tr'); var ids=[];
+    var tbody=g.querySelector('tbody'); if(!tbody) return [];
+    var rows=tbody.querySelectorAll('tr'); var ids=[];
     rows.forEach(function(r){
       if(!r.querySelector('.onedrivecheck-cell')){
-        var td=document.createElement('td'); td.className='onedrivecheck-cell'; td.textContent='—'; r.appendChild(td);
+        var td=document.createElement('td'); td.className='onedrivecheck-cell'; td.textContent='—';
+        td.style.whiteSpace='nowrap';
+        r.appendChild(td);
       }
       var id=rowId(r); if(id) ids.push(id);
     });
@@ -151,7 +163,7 @@ module.exports.onedrivecheck = function (parent) {
     g.querySelectorAll('tbody tr').forEach(function(r){
       var id=rowId(r); var td=r.querySelector('.onedrivecheck-cell'); if(!td) return;
       var s=(id && map && map[id])?map[id]:null;
-      if(!s){ td.textContent='—'; td.dataset.state=''; td.title=''; td.style.color=''; return; }
+      if(!s){ td.textContent='—'; td.dataset.state=''; td.title=''; td.style.color=''; td.style.fontWeight=''; return; }
       td.textContent = s.status || '—';
       td.title = '20707:'+(s.port20707?'open':'closed')+', 20773:'+(s.port20773?'open':'closed');
       var state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
@@ -168,12 +180,15 @@ module.exports.onedrivecheck = function (parent) {
 
   // ===== Device Page =====
   function currentNodeId(){
-    var e=document.querySelector('[data-nodeid], #deviceInfo');
-    if(e && e.dataset && e.dataset.nodeid) return e.dataset.nodeid;
+    var explicit = document.querySelector('[data-nodeid]'); if (explicit && explicit.dataset.nodeid) return explicit.dataset.nodeid;
+    var info = document.getElementById('deviceInfo'); if(info && info.dataset && info.dataset.nodeid) return info.dataset.nodeid;
     var h=location.hash||''; var m=h.match(/nodeid=([^&]+)/i); return m?decodeURIComponent(m[1]):null;
   }
   function ensureDevicePill(){
-    var host=document.querySelector('#p11, #p1, #deviceInfo, .DeviceInfo, #deviceSummary, .General') || document.querySelector('#p10');
+    var host = document.querySelector('#p11') || document.querySelector('#p1') ||
+               document.getElementById('deviceInfo') || document.querySelector('.DeviceInfo') ||
+               document.getElementById('deviceSummary') || document.querySelector('.General') ||
+               document.querySelector('#p10');
     if(!host) return null;
     var id='onedrivecheck-pill';
     var pill=document.getElementById(id);
@@ -197,19 +212,38 @@ module.exports.onedrivecheck = function (parent) {
     apiStatus([id]).then(paintDevice);
   }
 
-  // events + gentle polling
-  document.addEventListener('meshcentralDeviceListRefreshEnd', function(){ setTimeout(tickList, 200); });
-  document.addEventListener('meshcentralDeviceRefreshEnd', function(){ setTimeout(tickDevice, 200); });
+  // ===== observers & triggers =====
+  function onNav(){
+    setTimeout(function(){ badge(); tickList(); tickDevice(); }, 250);
+  }
 
-  // first run + keep-alive
-  setTimeout(function(){ badge(); tickList(); tickDevice(); }, 600);
+  // SPA hash navigation
+  window.addEventListener('hashchange', onNav);
+
+  // DOM lifecycle
+  document.addEventListener('DOMContentLoaded', function(){
+    onNav();
+    // Watch table area for redraws
+    var root = document.getElementById('Content') || document.body;
+    try {
+      var mo = new MutationObserver(function(){
+        // When rows change, repaint quickly
+        tickList();
+      });
+      mo.observe(root, { childList:true, subtree:true });
+    } catch (e) {}
+  });
+
+  // gentle keep-alive
   setInterval(function(){
     badge();
     if (table() && !document.getElementById('col_onedrivecheck')) tickList();
-  }, 5000);
+    // device page can change without hash sometimes
+    tickDevice();
+  }, 6000);
 })();`;
   }
 
-  log("onedrivecheck loaded (pluginadmin-only UI)");
+  log("onedrivecheck loaded (pluginadmin-only UI; robust DOM hooks)");
   return obj;
 };
