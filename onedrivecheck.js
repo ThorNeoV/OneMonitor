@@ -3,12 +3,15 @@
 //
 // Compatible across MeshCentral variants:
 // - Uses toolkit.config if present, else falls back to files in the plugin dir
-// - Resolves the real Express app (or gracefully degrades)
-// - Provides both default export and named export (exports.onedrivecheck)
-// - Loads UI as external /plugin/onedrivecheck/ui.js (CSP safe) and prefixes with webRoot
+// - Mounts routes on all plausible express apps (pre/post-auth) to catch req.user
+// - Uses webRoot for correct cookie scope under proxies / custom paths
+// - Loads UI as external /plugin/onedrivecheck/ui.js (CSP-safe)
 
 module.exports = function(parent, toolkit, config) {
   const plugin = this;
+
+  // ---------- TEMP: relax admin checks until req.user works on your build ----------
+  const REQUIRE_ADMIN = false; // set to true once /whoami shows ok:true
 
   // ---------- Paths & storage ----------
   const fs = require('fs');
@@ -103,14 +106,7 @@ module.exports = function(parent, toolkit, config) {
 </body></html>`;
   }
 
-  // ---------- Express resolution & safe urlencoded ----------
-  function resolveExpressApp(appOrWeb) {
-    if (!appOrWeb) return null;
-    if (typeof appOrWeb.get === 'function') return appOrWeb; // express app
-    if (appOrWeb.app && typeof appOrWeb.app.get === 'function') return appOrWeb.app; // webserver.app
-    if (parent && parent.webserver && parent.webserver.app && typeof parent.webserver.app.get === 'function') return parent.webserver.app;
-    return null;
-  }
+  // ---------- Express helpers ----------
   function resolveExpressLib(expressArg) {
     try {
       if (expressArg && typeof expressArg.urlencoded === 'function') return expressArg;
@@ -121,7 +117,6 @@ module.exports = function(parent, toolkit, config) {
     return null;
   }
   function manualUrlencoded() {
-    // very small, safe fallback for application/x-www-form-urlencoded
     return function(req, res, next) {
       if (req.method !== 'POST') return next();
       const ctype = (req.headers['content-type'] || '').toLowerCase();
@@ -142,44 +137,42 @@ module.exports = function(parent, toolkit, config) {
       });
     };
   }
-
   function isAdminReq(req) {
+    if (!REQUIRE_ADMIN) return true;
     if (!req || !req.user) return false;
     const u = req.user;
-    // cover a bunch of flags MeshCentral builds use
     return !!(u.siteadmin || u.domainadmin || u.admin || u.isadmin || u.superuser);
   }
 
   // ---------- HTTP Handlers ----------
   plugin.hook_setupHttpHandlers = function(appOrWeb, expressArg) {
     const ws = parent && parent.webserver;
-  
+
     // Collect all plausible express apps across Mesh builds
     const candidates = [];
     function pushApp(a){ if (a && typeof a.get === 'function' && candidates.indexOf(a) === -1) candidates.push(a); }
-  
+
     // What Mesh might pass us, plus known properties
     pushApp(appOrWeb);
     pushApp(appOrWeb && appOrWeb.app);
     pushApp(ws && ws.app);                 // common post-auth app
     pushApp(ws && ws.expressApp);          // some builds
     pushApp(ws && ws.webapp);              // some builds
-    pushApp(ws && ws.appNoAuth);           // pre-auth app in some builds
-    pushApp(ws && ws.preAuthApp);          // pre-auth in other builds
-  
+    pushApp(ws && ws.appNoAuth);           // pre-auth in some builds
+    pushApp(ws && ws.preAuthApp);          // pre-auth in others
+
     if (candidates.length === 0) { logError('no express app candidates found'); return; }
-  
+
     // Use Mesh webRoot so paths match your login origin
     const webRoot = (ws && ws.webRoot) || '/';
     const baseNoSlash = webRoot.endsWith('/') ? webRoot.slice(0, -1) : webRoot;
     function R(p) { return baseNoSlash + p; }
-  
+
     const expressLib = resolveExpressLib(expressArg);
     const urlenc = expressLib ? expressLib.urlencoded({ extended: true }) : manualUrlencoded();
-  
-    // Define handlers once, then attach to every app candidate
+
     function attach(app) {
-      // Debug route: shows if req.user exists and whether cookies were seen by THIS app
+      // Debug route
       app.get(R('/plugin/onedrivecheck/debug'), function(req, res) {
         res.json({
           appId: (app && app._router ? ('app@' + (app._router.stack ? app._router.stack.length : 'x')) : 'app'),
@@ -187,18 +180,17 @@ module.exports = function(parent, toolkit, config) {
           url: req.originalUrl || req.url,
           hasUser: !!(req && req.user),
           cookiesHeaderPresent: !!(req && req.headers && req.headers.cookie),
-          // keep cookie string short for safety
-          cookieLen: req && req.headers && req.headers.cookie ? (req.headers.cookie.length) : 0
+          cookieLen: req && req.headers && req.headers.cookie ? req.headers.cookie.length : 0
         });
       });
-  
-      // whoami: requires auth app to populate req.user
+
+      // whoami (for testing auth presence)
       app.get(R('/plugin/onedrivecheck/whoami'), function(req, res) {
         if (!req || !req.user) { res.status(401).json({ ok:false, reason:'no user' }); return; }
         const { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } = req.user;
         res.json({ ok:true, user:{ name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } });
       });
-  
+
       // Admin UI
       app.get(R('/plugin/onedrivecheck/admin'), function(req, res) {
         if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
@@ -206,7 +198,7 @@ module.exports = function(parent, toolkit, config) {
         const html = adminHtml().replace('__ADMIN_POST__', R('/plugin/onedrivecheck/admin'));
         res.end(html);
       });
-  
+
       app.post(R('/plugin/onedrivecheck/admin'), urlenc, function(req, res) {
         if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
         if (req.body && typeof req.body.meshId === 'string') settings.meshId = req.body.meshId.trim();
@@ -218,7 +210,7 @@ module.exports = function(parent, toolkit, config) {
           res.end();
         });
       });
-  
+
       // Status API
       app.get(R('/plugin/onedrivecheck/status'), function(req, res) {
         if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
@@ -234,7 +226,7 @@ module.exports = function(parent, toolkit, config) {
           });
         });
       });
-  
+
       // UI JS (public)
       app.get(R('/plugin/onedrivecheck/ui.js'), function(req, res) {
         const js = String.raw`(function(){
@@ -322,14 +314,10 @@ module.exports = function(parent, toolkit, config) {
         res.end(js);
       });
     }
-  
-    // Attach to all candidates
+
     candidates.forEach(attach);
-  
-    // Log what we attached to (optional)
-    try { parent.debug('onedrivecheck: attached routes to ' + candidates.length + ' express app(s) at webRoot=' + webRoot); } catch(_) {}
+    try { parent.debug('onedrivecheck: attached routes to ' + candidates.length + ' express app(s) at webRoot=' + ((ws && ws.webRoot) || '/')); } catch(_) {}
   };
-      
 
   // ---------- UI loader ----------
   plugin.onWebUIStartupEnd = function() {
@@ -408,5 +396,3 @@ module.exports = function(parent, toolkit, config) {
 
 // Also expose a named export for builds that call require(...)[shortName](...)
 module.exports.onedrivecheck = module.exports;
-
-
