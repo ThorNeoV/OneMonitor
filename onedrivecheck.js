@@ -1,24 +1,21 @@
 "use strict";
 
-/** OneDriveCheck – minimal, auth-aware debug plugin
- * shortName: onedrivecheck
- * Safe: no timers, no DB writes, no UI injection.
- */
+/** OneDriveCheck – column & device pill via pluginadmin bridge (auth-safe) */
 module.exports.onedrivecheck = function (parent) {
   const obj = {};
   obj.parent = parent;
   obj.meshServer = parent.parent;
-  const ws = parent.webserver;
 
-  // ---------- logging helpers
   const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{ console.log("onedrivecheck:", m); } };
   const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{ console.error("onedrivecheck error:", e); } };
 
-  // ---------- helpers
-  const webRoot = (ws && ws.webRoot) || "/";
-  const baseNoSlash = webRoot.endsWith("/") ? webRoot.slice(0,-1) : webRoot;
-  const R = (p)=> baseNoSlash + p;
-  const isSiteAdmin = (user)=> !!user && ((user.siteadmin|0) & 0xFFFFFFFF) !== 0;
+  // --- helpers
+  const fs = require("fs");
+  const path = require("path");
+  const plugindir = __dirname;
+  const statusFile = path.join(plugindir, "statuses.json");
+  function readStatuses(){ try{ return JSON.parse(fs.readFileSync(statusFile, "utf8")); }catch{ return {}; } }
+  function writeStatuses(v){ try{ fs.writeFileSync(statusFile, JSON.stringify(v||{}, null, 2)); }catch(e){ err(e); } }
 
   function summarizeUser(u){
     if (!u) return null;
@@ -26,33 +23,47 @@ module.exports.onedrivecheck = function (parent) {
     return { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser };
   }
 
-  function summarizeHeaders(h){
-    if (!h) return {};
-    // only show a few to avoid noise
-    const pick = ["host","cookie","cf-cache-status","cf-ray","cf-visitor","x-forwarded-for","x-forwarded-proto","x-forwarded-host","via","user-agent","accept","cache-control"];
-    const out = {};
-    for (const k of pick) { if (h[k]) out[k] = String(h[k]); }
-    // add cookie length (don’t echo the cookie itself)
-    out.cookieLength = h.cookie ? String(h.cookie.length) : 0;
-    return out;
+  // --- very simple fake status (for now): alternate states so you can see the UI.
+  // replace later with real checks (shell/Test-NetConnection, etc.)
+  function mockStatusFor(id){
+    const h = readStatuses();
+    if (!h[id]) {
+      const states = [
+        { status:"App Online", port20707:true,  port20773:false },
+        { status:"Not signed in", port20707:false, port20773:true },
+        { status:"Offline", port20707:false, port20773:false }
+      ];
+      h[id] = states[(Math.abs(hashCode(id)) % states.length)];
+      writeStatuses(h);
+    }
+    return h[id];
   }
+  function hashCode(s){ let h=0; for (let i=0;i<s.length;i++){h=((h<<5)-h)+s.charCodeAt(i); h|=0;} return h; }
 
-  // ---------- REQUIRED: plugin-admin bridge (works reliably through Mesh)
-  // Examples while logged in:
+  // ---------- REQUIRED: plugin-admin bridge (works with auth on your server)
+  // URLs:
   //  - /pluginadmin.ashx?pin=onedrivecheck&debug=1
   //  - /pluginadmin.ashx?pin=onedrivecheck&whoami=1
-  //  - /pluginadmin.ashx?pin=onedrivecheck&admin=1
+  //  - /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<nodeId>[&id=<nodeId>...]
+  //  - /pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js
   obj.handleAdminReq = function(req, res, user) {
     try {
+      // include static (our ui.js)
+      if (req.query.include == 1) {
+        // only allow ui.js
+        const file = String(req.query.path||"").replace(/\\/g,"/").trim();
+        if (file !== "ui.js") { res.sendStatus(404); return; }
+        res.setHeader("Content-Type","application/javascript; charset=utf-8");
+        res.end(buildClientJS());
+        return;
+      }
+
       if (req.query.debug == 1) {
         res.json({
           ok: true,
           via: "handleAdminReq",
-          webRoot,
           hasUser: !!user,
-          user: summarizeUser(user),
-          headers: summarizeHeaders(req.headers),
-          hasSession: !!req.session
+          user: summarizeUser(user)
         });
         return;
       }
@@ -63,40 +74,14 @@ module.exports.onedrivecheck = function (parent) {
         return;
       }
 
-      if (req.query.admin == 1) {
-        if (!isSiteAdmin(user)) { res.sendStatus(401); return; }
-        const html = `<!doctype html>
-<html><head><meta charset="utf-8"><title>OneDriveCheck – Admin</title></head>
-<body style="font-family:sans-serif;padding:20px;max-width:860px">
-  <h2>OneDriveCheck – Admin</h2>
-  <p>Authenticated as site admin.</p>
-  <ul>
-    <li><a href="?pin=onedrivecheck&debug=1">Debug (JSON)</a></li>
-    <li><a href="?pin=onedrivecheck&whoami=1">Who am I</a></li>
-    <li><a target="_blank" href="${R('/plugin/onedrivecheck/debug')}">Express Debug (bypasses pluginadmin)</a></li>
-    <li><a target="_blank" href="${R('/plugin/onedrivecheck/whoami')}">Express Who am I</a></li>
-  </ul>
-  <p>If Express debug shows <code>hasUser:false</code> but admin debug shows <code>true</code>, your proxy/CDN is interfering with cookies on <code>/plugin/*</code>. Add a cache bypass for <code>/plugin/*</code> and <code>/pluginadmin.ashx*</code>.</p>
-</body></html>`;
-        res.setHeader("Content-Type","text/html; charset=utf-8");
-        res.end(html);
-        return;
-      }
-
-      if (req.query.user == 1) {
-        // simple user page
-        const html = `<!doctype html>
-<html><head><meta charset="utf-8"><title>OneDriveCheck</title></head>
-<body style="font-family:sans-serif;padding:20px;max-width:860px">
-  <h2>OneDriveCheck</h2>
-  <p>Authenticated user page.</p>
-  <ul>
-    <li><a href="?pin=onedrivecheck&debug=1">Debug (JSON)</a></li>
-    <li><a href="?pin=onedrivecheck&whoami=1">Who am I</a></li>
-  </ul>
-</body></html>`;
-        res.setHeader("Content-Type","text/html; charset=utf-8");
-        res.end(html);
+      if (req.query.status == 1) {
+        if (!user) { res.status(401).end("Unauthorized"); return; }
+        let ids = req.query.id;
+        if (!ids) { res.json({}); return; }
+        if (!Array.isArray(ids)) ids = [ids];
+        const out = {};
+        ids.forEach((id)=>{ out[id] = mockStatusFor(id); });
+        res.json(out);
         return;
       }
 
@@ -107,41 +92,112 @@ module.exports.onedrivecheck = function (parent) {
     }
   };
 
-  // ---------- OPTIONAL: direct Express routes (will show CDN/proxy issues)
-  function attachExpress(app){
-    app.get(R("/plugin/onedrivecheck/debug"), function(req,res){
-      res.json({
-        ok: true,
-        via: "express",
-        webRoot,
-        hasUser: !!req.user,
-        user: summarizeUser(req.user),
-        headers: summarizeHeaders(req.headers),
-        hasSession: !!req.session
-      });
-    });
-
-    app.get(R("/plugin/onedrivecheck/whoami"), function(req,res){
-      if (!req.user) { res.status(401).json({ ok:false, reason:"no user" }); return; }
-      res.json({ ok:true, user: summarizeUser(req.user) });
-    });
-
-    // tiny no-auth endpoint to help test cache bypass rules
-    app.get(R("/plugin/onedrivecheck/ping"), function(req,res){
-      res.json({ ok:true, t: Date.now() });
-    });
-
-    log("express routes mounted at /plugin/onedrivecheck/* (webRoot=" + webRoot + ")");
-  }
-
-  // Mesh will call this hook after it wires cookie-session/auth
-  obj.hook_setupHttpHandlers = function(appOrWeb/*, express */){
-    const app = (appOrWeb && typeof appOrWeb.get === "function")
-      ? appOrWeb
-      : (appOrWeb && appOrWeb.app && typeof appOrWeb.app.get === "function" ? appOrWeb.app : null);
-    if (!app) { err("hook_setupHttpHandlers: no valid app"); return; }
-    try { attachExpress(app); } catch(e){ err(e); }
+  // ---------- Inject UI on device list + device page
+  obj.onWebUIStartupEnd = function () {
+    // Load our JS via pluginadmin bridge (authenticated & cache-friendly)
+    return `<script src="/pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js"></script>`;
   };
 
+  // ---------- client-side JS (creates column + device pill)
+  function buildClientJS(){
+    return `(function(){
+  "use strict";
+
+  function apiStatus(ids){
+    var url = '/pluginadmin.ashx?pin=onedrivecheck&status=1' + ids.map(function(id){ return '&id=' + encodeURIComponent(id); }).join('');
+    return fetch(url, { credentials:'same-origin' }).then(function(r){ return r.json(); }).catch(function(){ return {}; });
+  }
+
+  // ===== Device List =====
+  function table(){ return document.querySelector('#devices, #devicesTable'); }
+  function rowId(row){
+    return row.getAttribute('deviceid') || row.dataset.deviceid ||
+           (row.id && row.id.startsWith('d_') ? row.id.substring(2) : null) ||
+           row.getAttribute('nodeid') || row.dataset.nodeid || null;
+  }
+  function addHeader(){
+    var g=table(); if(!g) return false;
+    var thead=g.querySelector('thead'); if(!thead) return false;
+    var tr=thead.querySelector('tr'); if(!tr) return false;
+    if(!document.getElementById('col_onedrivecheck')){
+      var th=document.createElement('th'); th.id='col_onedrivecheck'; th.textContent='OneDriveCheck'; tr.appendChild(th);
+    }
+    return true;
+  }
+  function ensureCells(){
+    var g=table(); if(!g) return [];
+    var rows=g.querySelectorAll('tbody tr'); var ids=[];
+    rows.forEach(function(r){
+      if(!r.querySelector('.onedrivecheck-cell')){
+        var td=document.createElement('td'); td.className='onedrivecheck-cell'; td.textContent='—'; r.appendChild(td);
+      }
+      var id=rowId(r); if(id) ids.push(id);
+    });
+    return ids;
+  }
+  function paintList(map){
+    var g=table(); if(!g) return;
+    g.querySelectorAll('tbody tr').forEach(function(r){
+      var id=rowId(r); var td=r.querySelector('.onedrivecheck-cell'); if(!td) return;
+      var s=(id && map && map[id])?map[id]:null;
+      if(!s){ td.textContent='—'; td.dataset.state=''; td.title=''; return; }
+      td.textContent = s.status || '—';
+      td.title = '20707:'+(s.port20707?'open':'closed')+', 20773:'+(s.port20773?'open':'closed');
+      td.dataset.state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
+      td.style.color = (td.dataset.state==='online'?'#0a0':(td.dataset.state==='notsigned'?'#b80':'#c00'));
+      td.style.fontWeight = '600';
+    });
+  }
+  function tickList(){
+    if(!addHeader()) return;
+    var ids=ensureCells(); if(ids.length===0) return;
+    apiStatus(ids).then(paintList);
+  }
+
+  // ===== Device Page =====
+  function currentNodeId(){
+    var e=document.querySelector('[data-nodeid], #deviceInfo'); 
+    if(e && e.dataset && e.dataset.nodeid) return e.dataset.nodeid;
+    var h=location.hash||''; var m=h.match(/nodeid=([^&]+)/i); return m?decodeURIComponent(m[1]):null;
+  }
+  function ensureDevicePill(){
+    var host=document.querySelector('#p11, #p1, #deviceInfo, .DeviceInfo, #deviceSummary, .General'); // try common containers
+    if(!host) return null;
+    var id='onedrivecheck-pill';
+    var pill=document.getElementById(id);
+    if(!pill){
+      pill=document.createElement('div'); pill.id=id;
+      pill.style.marginTop='6px'; pill.style.fontWeight='600';
+      host.appendChild(pill);
+    }
+    return pill;
+  }
+  function paintDevice(map){
+    var id=currentNodeId(); if(!id) return;
+    var s=map[id]; var pill=ensureDevicePill(); if(!pill) return;
+    if(!s){ pill.textContent='OneDriveCheck: —'; pill.style.color='#666'; return; }
+    pill.textContent='OneDriveCheck: ' + s.status + '  (20707:'+(s.port20707?'open':'closed')+', 20773:'+(s.port20773?'open':'closed')+')';
+    pill.style.color = (s.port20707 ? '#0a0' : (s.port20773 ? '#b80' : '#c00'));
+  }
+  function tickDevice(){
+    var id=currentNodeId(); if(!id) return;
+    apiStatus([id]).then(paintDevice);
+  }
+
+  // Bind to Mesh’s refresh signals if available; otherwise poll gently
+  document.addEventListener('meshcentralDeviceListRefreshEnd', function(){ setTimeout(tickList, 200); });
+  document.addEventListener('meshcentralDeviceRefreshEnd', function(){ setTimeout(tickDevice, 200); });
+
+  // initial kicks & light keep-alives (in case events don’t fire)
+  setTimeout(tickList, 600);
+  setTimeout(tickDevice, 800);
+  setInterval(function(){
+    // Repaint if table/header went away due to navigation
+    if (table() && !document.getElementById('col_onedrivecheck')) tickList();
+  }, 5000);
+})();`;
+  }
+
+  log("onedrivecheck plugin loaded (pluginadmin bridge)");
   return obj;
 };
