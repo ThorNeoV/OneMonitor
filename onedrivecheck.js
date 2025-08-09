@@ -1,29 +1,29 @@
 "use strict";
 
-/** OneDriveCheck – LIVE status + debug UI loader */
+/** OneDriveCheck – status API + robust UI injector (dual-path) */
 module.exports.onedrivecheck = function (parent) {
   const obj = {};
   obj.parent = parent;
   obj.meshServer = parent.parent;
+  const ws = parent.webserver;
 
+  // Some Mesh builds only load known hooks if listed here:
+  obj.exports = [
+    "handleAdminReq",
+    "hook_setupHttpHandlers",
+    "onWebUIStartupEnd"
+  ];
+
+  // --- logging
   const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{ console.log("onedrivecheck:", m); } };
   const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{ console.error("onedrivecheck error:", e); } };
 
-  // ----- helpers
-  function summarizeUser(u){
-    if (!u) return null;
-    const { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } = u;
-    return { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser };
-  }
-  function briefHeaders(req){
-    const h = (req && req.headers) || {};
-    const keep = ["host","user-agent","x-forwarded-for","x-forwarded-proto","x-forwarded-host","cf-ray","accept"];
-    const o = {}; keep.forEach(k=>{ if(h[k]) o[k]=h[k]; });
-    o.cookieLength = (h.cookie||"").length;
-    return o;
-  }
+  // --- helpers
+  const webRoot = (ws && ws.webRoot) || "/";
+  const baseNoSlash = webRoot.endsWith("/") ? webRoot.slice(0,-1) : webRoot;
+  const R = (p)=> baseNoSlash + p;
 
-  // ===== LIVE STATUS CHECKS =====
+  // ===== live checks (short TTL cache)
   const CACHE_TTL_MS = 15000;
   const cache = new Map(); // nodeId -> { t, val }
 
@@ -32,6 +32,12 @@ module.exports.onedrivecheck = function (parent) {
       const a = obj.meshServer.webserver && obj.meshServer.webserver.wsagents;
       return !!(a && a[nodeId]);
     } catch { return false; }
+  }
+
+  function summarizeUser(u){
+    if (!u) return null;
+    const { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser } = u;
+    return { name, userid, domain, siteadmin, domainadmin, admin, isadmin, superuser };
   }
 
   function sendShell(nodeId, cmd){
@@ -81,7 +87,7 @@ module.exports.onedrivecheck = function (parent) {
     return val;
   }
 
-  // ========== AUTH BRIDGE ==========
+  // ========== ADMIN BRIDGE ==========
   // /pluginadmin.ashx?pin=onedrivecheck&debug=1
   // /pluginadmin.ashx?pin=onedrivecheck&whoami=1
   // /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<nodeId>[&id=...]
@@ -97,7 +103,7 @@ module.exports.onedrivecheck = function (parent) {
       }
 
       if (req.query.debug == 1) {
-        res.json({ ok:true, via:"handleAdminReq", hasUser:!!user, user:summarizeUser(user), hasSession:!!(req && req.session), headers: briefHeaders(req) });
+        res.json({ ok:true, via:"handleAdminReq", hasUser:!!user, user:summarizeUser(user), hasSession:!!(req && req.session) });
         return;
       }
 
@@ -132,19 +138,39 @@ module.exports.onedrivecheck = function (parent) {
     } catch (e) { err(e); res.sendStatus(500); }
   };
 
-  // Inject UI script everywhere (cache-busted)
-  obj.onWebUIStartupEnd = function () {
-    const v = (Date.now() % 1e6);
-    return `<script src="/pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js&v=${v}"></script>`;
+  // ========== EXPRESS FALLBACK (SECOND URL PATH) ==========
+  function attachExpress(app){
+    app.get(R("/plugin/onedrivecheck/ui.js"), function(_req,res){
+      res.setHeader("Content-Type","application/javascript; charset=utf-8");
+      res.end(buildClientJS());
+    });
+    log("express: serving UI at " + R("/plugin/onedrivecheck/ui.js"));
+  }
+
+  obj.hook_setupHttpHandlers = function(appOrWeb){
+    const app = (appOrWeb && typeof appOrWeb.get === "function")
+      ? appOrWeb
+      : (appOrWeb && appOrWeb.app && typeof appOrWeb.app.get === "function" ? appOrWeb.app : null);
+    if (!app) { err("hook_setupHttpHandlers: no valid app"); return; }
+    try { attachExpress(app); } catch(e){ err(e); }
   };
 
-  // --------- Client JS with DEBUG beacons
+  // ========== INJECT BOTH (whichever loads wins) ==========
+  obj.onWebUIStartupEnd = function () {
+    const v = (Date.now() % 1e6);
+    const a = `/pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js&v=${v}`;
+    const b = `${R("/plugin/onedrivecheck/ui.js")}?v=${v}`;
+    log("injecting UI script tags");
+    return `<script src="${a}"></script><script src="${b}"></script>`;
+  };
+
+  // ========== CLIENT JS ==========
   function buildClientJS(){
     return `(()=>{"use strict";
   const DBG=(...a)=>{ try{ console.log("%c[ODC]", "color:#06c;font-weight:700", ...a);}catch{} };
   DBG("ui boot");
 
-  // Always paint a tiny floating chip so we know the script loaded
+  // Boot chip so we know script loaded
   function chip(){
     if(document.getElementById("odc-chip")) return;
     const d=document.createElement("div");
@@ -283,6 +309,6 @@ module.exports.onedrivecheck = function (parent) {
 })();`;
   }
 
-  log("onedrivecheck loaded (debug UI)");
+  log("onedrivecheck loaded");
   return obj;
 };
