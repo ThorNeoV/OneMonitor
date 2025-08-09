@@ -1,7 +1,7 @@
 {
   "name": "OneDriveCheckService Monitor",
   "shortName": "onedrivecheck",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": "Thorsten Klingelhoeffer",
   "description": "Monitors OneDriveCheckService, restarts if offline, shows status in device view.",
   "hasAdminPanel": true,
@@ -13,5 +13,6 @@
     "type": "git",
     "url": "https://github.com/ThorNeoV/OneMonitor.git"
   },
+
   "meshCentralCompat": ">=1.0.0"
 }
