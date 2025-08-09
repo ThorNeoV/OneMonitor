@@ -1,39 +1,80 @@
 // OneDriveCheckService Monitor for MeshCentral
 // shortName: onedrivecheck
 //
-// Single-file plugin:
-//  - Admin page:  /plugin/onedrivecheck/admin
-//  - Status API:  /plugin/onedrivecheck/status?id=<nodeId>&id=<nodeId>
-//  - UI script:   /plugin/onedrivecheck/ui.js  (linked via onWebUIStartupEnd)
+// Works across plugin API variants:
+// - If toolkit.config exists, uses it for settings/status; else falls back to files in plugin dir
+// - Resolves Express app regardless of whether webserver object or app is passed
+// - Exposes both default and named export (exports.onedrivecheck) for different loaders
+//
+// Endpoints:
+//   /plugin/onedrivecheck/admin
+//   /plugin/onedrivecheck/status?id=<nodeId>&id=<nodeId>
+//   /plugin/onedrivecheck/ui.js  (CSP-safe UI)
 
 module.exports = function(parent, toolkit, config) {
   const plugin = this;
 
-  // ---- Settings & state ----------------------------------------------------
-  // Stored via toolkit.config under key "settings"
-  let settings = { meshId: null, pollInterval: 60 }; // seconds (min 10)
-  let pollTimer = null;
+  // ---------- Paths & storage fallbacks ----------
+  const fs = require('fs');
+  const path = require('path');
+  const plugindir = (config && config.__plugindir) ? config.__plugindir : __dirname;
 
-  // ---- Helpers -------------------------------------------------------------
-  const isAdminReq = (req) => !!(req && req.user && (req.user.siteadmin || req.user.domainadmin));
+  // simple file-backed store (used if toolkit.config is unavailable)
+  const fileStore = {
+    _read(name) {
+      try { return JSON.parse(fs.readFileSync(path.join(plugindir, name), 'utf8')); } catch { return null; }
+    },
+    _write(name, obj) {
+      try { fs.writeFileSync(path.join(plugindir, name), JSON.stringify(obj || {}, null, 2)); } catch (e) { logError(e); }
+    },
+    async get(key, cb) {
+      // only keys we use: 'settings' and 'status:<nodeId>'
+      if (key === 'settings') {
+        cb(this._read('settings.json') || null);
+      } else if (key.startsWith('status:')) {
+        const all = this._read('statuses.json') || {};
+        cb(all[key] || null);
+      } else {
+        cb(null);
+      }
+    },
+    async set(key, val, cb) {
+      if (key === 'settings') {
+        this._write('settings.json', val || {});
+      } else if (key.startsWith('status:')) {
+        const all = this._read('statuses.json') || {};
+        all[key] = val || null;
+        this._write('statuses.json', all);
+      }
+      cb && cb();
+    }
+  };
 
-  const statusKey = (id) => `status:${id}`;
-  function saveStatus(deviceId, obj, cb) {
-    try { obj = obj || {}; obj.lastChecked = Date.now(); } catch(_) {}
-    toolkit.config.set(statusKey(deviceId), obj, () => cb && cb());
-  }
-  function getStatus(deviceId, cb) {
-    toolkit.config.get(statusKey(deviceId), (v) => cb && cb(v || null));
-  }
+  // choose store
+  const store = (toolkit && toolkit.config) ? toolkit.config : fileStore;
 
+  // ---------- Logging helpers ----------
   function logInfo(msg){ try { parent.info('onedrivecheck: ' + msg); } catch(_) {} }
   function logDebug(msg){ try { parent.debug('onedrivecheck: ' + msg); } catch(_) {} }
   function logError(err){ try { parent.debug('onedrivecheck error: ' + (err && err.stack || err)); } catch(_) {} }
 
-  // ---- Startup -------------------------------------------------------------
+  // ---------- Settings & status ----------
+  let settings = { meshId: null, pollInterval: 60 }; // seconds (min 10)
+  let pollTimer = null;
+
+  const statusKey = (id) => `status:${id}`;
+  function saveStatus(deviceId, obj, cb) {
+    try { obj = obj || {}; obj.lastChecked = Date.now(); } catch(_) {}
+    store.set(statusKey(deviceId), obj, () => cb && cb());
+  }
+  function getStatus(deviceId, cb) {
+    store.get(statusKey(deviceId), (v) => cb && cb(v || null));
+  }
+
+  // ---------- Startup ----------
   plugin.server_startup = function() {
     logInfo('server_startup');
-    toolkit.config.get('settings', function(val) {
+    store.get('settings', function(val) {
       if (val) settings = Object.assign(settings, val);
       logInfo('settings=' + JSON.stringify(settings));
       schedulePolling(true);
@@ -44,12 +85,12 @@ module.exports = function(parent, toolkit, config) {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     if (!settings.meshId) { logInfo('no meshId set; not polling'); return; }
     const intervalMs = Math.max(10, parseInt(settings.pollInterval || 60, 10)) * 1000;
-    logInfo('polling every ' + (intervalMs / 1000) + 's');
+    logInfo('polling every ' + (intervalMs/1000) + 's');
     pollTimer = setInterval(pollDevices, intervalMs);
     if (forceRunNow) pollDevices();
   }
 
-  // ---- Admin HTML ----------------------------------------------------------
+  // ---------- Admin HTML ----------
   function adminHtml() {
     const meshIdVal = settings.meshId ? String(settings.meshId) : '';
     const pollVal = String(settings.pollInterval || 60);
@@ -64,14 +105,26 @@ module.exports = function(parent, toolkit, config) {
     <input type="number" min="10" name="pollInterval" value="${pollVal}" style="width:120px"/><br/><br/>
     <input type="submit" value="Save" />
   </form>
-  <p style="margin-top:14px;color:#555">
-    Tip: Find your Mesh Group ID under <em>Groups → Info</em> in MeshCentral.
-  </p>
+  <p style="margin-top:14px;color:#555">Tip: Groups → Info shows the meshId.</p>
 </body></html>`;
   }
 
-  // ---- HTTP Handlers -------------------------------------------------------
-  plugin.hook_setupHttpHandlers = function(app, express) {
+  // ---------- HTTP handlers (robust to different args) ----------
+  function resolveExpressApp(appOrWeb) {
+    // Try a bunch of common layouts
+    if (!appOrWeb) return null;
+    if (typeof appOrWeb.get === 'function') return appOrWeb;                 // raw express app
+    if (appOrWeb.app && typeof appOrWeb.app.get === 'function') return appOrWeb.app; // webserver.app
+    if (parent && parent.webserver && parent.webserver.app && typeof parent.webserver.app.get === 'function') return parent.webserver.app;
+    return null;
+  }
+
+  const isAdminReq = (req) => !!(req && req.user && (req.user.siteadmin || req.user.domainadmin));
+
+  plugin.hook_setupHttpHandlers = function(appOrWeb, express) {
+    const app = resolveExpressApp(appOrWeb);
+    if (!app) { logError('could not resolve express app'); return; }
+
     // Admin UI
     app.get('/plugin/onedrivecheck/admin', function(req, res) {
       if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
@@ -83,7 +136,7 @@ module.exports = function(parent, toolkit, config) {
       if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
       if (typeof req.body.meshId === 'string') settings.meshId = req.body.meshId.trim();
       if (req.body.pollInterval) settings.pollInterval = Math.max(10, parseInt(req.body.pollInterval, 10) || 60);
-      toolkit.config.set('settings', settings, function() {
+      store.set('settings', settings, function() {
         logInfo('settings saved: ' + JSON.stringify(settings));
         schedulePolling(true);
         res.writeHead(302, { Location: '/plugin/onedrivecheck/admin' });
@@ -97,7 +150,6 @@ module.exports = function(parent, toolkit, config) {
       let ids = req.query.id;
       if (!ids) { res.json({}); return; }
       if (!Array.isArray(ids)) ids = [ids];
-
       let out = {};
       let pending = ids.length;
       ids.forEach((id) => {
@@ -108,7 +160,7 @@ module.exports = function(parent, toolkit, config) {
       });
     });
 
-    // UI JS (CSP-safe: external script)
+    // UI JS (CSP-safe)
     app.get('/plugin/onedrivecheck/ui.js', function(req, res) {
       if (!req.user) { res.status(403).end('Forbidden'); return; }
       const js = `(function(){
@@ -197,21 +249,18 @@ module.exports = function(parent, toolkit, config) {
     });
   };
 
-  // ---- UI loader (injects external JS) ------------------------------------
+  // ---------- UI loader ----------
   plugin.onWebUIStartupEnd = function() {
     return `<script src="/plugin/onedrivecheck/ui.js"></script>`;
   };
 
-  // ---- Polling logic -------------------------------------------------------
-  // Device enumeration that works across builds: read nodes from DB & filter by meshid.
+  // ---------- Device enumeration & shell ----------
   function getDevicesInMesh(meshId) {
     return new Promise((resolve) => {
       try {
         parent.db.GetAllType('node', (nodes) => {
           const map = {};
-          (nodes || []).forEach((n) => {
-            if (n.meshid === meshId) map[n._id] = n;
-          });
+          (nodes || []).forEach((n) => { if (n.meshid === meshId) map[n._id] = n; });
           resolve(map);
         });
       } catch (e) { logError(e); resolve({}); }
@@ -221,7 +270,6 @@ module.exports = function(parent, toolkit, config) {
   function sendShell(deviceId, cmd) {
     return new Promise((resolve) => {
       const payload = { cmd: cmd, type: 'powershell' };
-      // parent.sendCommand(nodeId, 'shell', payload, cb)
       parent.sendCommand(deviceId, 'shell', payload, function(resp) {
         resolve(resp && resp.data ? String(resp.data) : '');
       });
@@ -248,8 +296,6 @@ module.exports = function(parent, toolkit, config) {
       for (const nodeId of ids) {
         const device = allDevices[nodeId];
         if (!device) continue;
-
-        // Only Windows nodes
         const osd = (device.osdesc || '').toLowerCase();
         if (!osd.includes('windows')) continue;
 
@@ -264,7 +310,6 @@ module.exports = function(parent, toolkit, config) {
 
         saveStatus(nodeId, status);
 
-        // If both closed, try restart
         if (!port20707 && !port20773) {
           await restartService(nodeId);
         }
@@ -274,4 +319,6 @@ module.exports = function(parent, toolkit, config) {
 
   return plugin;
 };
+
+// Also expose a named export for builds that call require(...)[shortName](...)
 module.exports.onedrivecheck = module.exports;
