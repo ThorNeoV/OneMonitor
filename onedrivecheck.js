@@ -67,44 +67,99 @@ module.exports.onedrivecheck = function (parent) {
   }
 
   // ===== REQUIRED: admin bridge only (no express, no UI injection)
+  // helper: normalize any UI/short id into DB key
+  function normalizeId(id) {
+    if (!id) return id;
+    // already a DB key?
+    if (/^node\/\/.+/i.test(id)) return id;
+    // Many UIs pass the short id; Mesh DB key is "node//" + short
+    return 'node//' + id;
+  }
+  
+  function listOnline() {
+    const a = (obj.meshServer.webserver && obj.meshServer.webserver.wsagents) || {};
+    const out = {};
+    for (const k of Object.keys(a)) {
+      try {
+        const n = a[k].dbNode || a[k].dbNodeKey || null;
+        // include a small summary when available
+        out[k] = {
+          key: k,
+          name: (n && (n.name || n.computername)) || null,
+          os: (n && (n.osdesc || n.agentcaps)) || null
+        };
+      } catch { out[k] = { key: k }; }
+    }
+    return out;
+  }
+
   obj.handleAdminReq = async function(req, res, user) {
     try {
-      // Simple menu page
-      if (req.query.menu == 1) {
-        if (!user) { res.status(401).end("Unauthorized"); return; }
-        const html = `<!doctype html>
-<html><head><meta charset="utf-8"><title>OneDriveCheck – Menu</title></head>
-<body style="font-family:sans-serif;padding:18px;max-width:900px">
-  <h2>OneDriveCheck – Menu</h2>
-  <ul>
-    <li><a href="?pin=onedrivecheck&whoami=1" target="_blank">Who am I (auth check)</a></li>
-    <li><a href="?pin=onedrivecheck&debug=1" target="_blank">Debug (session + env)</a></li>
-  </ul>
-  <h3>Quick status test</h3>
-  <ol>
-    <li>Open a device, copy its <code>nodeid</code> from the URL hash (e.g. <code>#...nodeid=XXXXXXXX@domain</code>).</li>
-    <li>Paste it below and click a test:</li>
-  </ol>
-  <form onsubmit="doTest(event)">
-    <input id="nid" type="text" placeholder="NODEID here" style="width:480px" required />
-    <button type="submit">Presence only</button>
-    <button type="button" onclick="doShell()">PowerShell probe (Windows)</button>
-  </form>
-  <pre id="out" style="margin-top:12px;padding:10px;border:1px solid #ccc;border-radius:6px;background:#f8f8f8;white-space:pre-wrap;min-height:80px"></pre>
-<script>
-function api(url){
-  return fetch(url, { credentials:'same-origin' }).then(r=>r.json()).catch(e=>({error:String(e)}));
-}
-function show(o){ document.getElementById('out').textContent = JSON.stringify(o,null,2); }
-function nid(){ return encodeURIComponent(document.getElementById('nid').value.trim()); }
-function doTest(e){ e.preventDefault(); api('?pin=onedrivecheck&status=1&id='+nid()).then(show); }
-function doShell(){ api('?pin=onedrivecheck&status=1&shell=1&id='+nid()).then(show); }
-</script>
-</body></html>`;
-        res.setHeader("Content-Type","text/html; charset=utf-8");
-        res.end(html);
+      // serve UI loader (unchanged)
+      if (req.query.include == 1) {
+        const file = String(req.query.path||"").replace(/\\/g,"/").trim();
+        if (file !== "ui.js") { res.sendStatus(404); return; }
+        res.setHeader("Content-Type","application/javascript; charset=utf-8");
+        res.end(buildClientJS());
         return;
       }
+  
+      // quick introspection
+      if (req.query.debug == 1) {
+        res.json({ ok:true, via:"handleAdminReq", hasUser:!!user, user:summarizeUser(user), hasSession:!!(req && req.session) });
+        return;
+      }
+      if (req.query.whoami == 1) {
+        if (!user) { res.status(401).json({ ok:false, reason:"no user" }); return; }
+        res.json({ ok:true, user:summarizeUser(user) });
+        return;
+      }
+  
+      // NEW: list all online agent keys (copy an id from here)
+      if (req.query.listonline == 1) {
+        if (!user) { res.status(401).end("Unauthorized"); return; }
+        res.json({ ok:true, agents:listOnline() });
+        return;
+      }
+  
+      // NEW: simple shell echo to verify shell works on a single node
+      if (req.query.echoshell == 1) {
+        if (!user) { res.status(401).end("Unauthorized"); return; }
+        const raw = req.query.id;
+        if (!raw) { res.json({ ok:false, reason:"missing id"}); return; }
+        const id = normalizeId(Array.isArray(raw) ? raw[0] : raw);
+        const out = await sendShell(id, `cmd /c echo odc_ok || powershell -NoProfile -Command "Write-Host odc_ok"`);
+        res.json({ ok:true, id, output: String(out||"") });
+        return;
+      }
+  
+      // STATUS: supports multiple ids; now normalizes each id before use
+      if (req.query.status == 1) {
+        if (!user) { res.status(401).end("Unauthorized"); return; }
+        let ids = req.query.id;
+        if (!ids) { res.json({}); return; }
+        if (!Array.isArray(ids)) ids = [ids];
+  
+        ids = ids.map(normalizeId);
+  
+        const out = {};
+        const queue = ids.slice();
+        const MAX_PAR = 5;
+        async function worker(){
+          while(queue.length){
+            const id = queue.shift();
+            try { out[id] = await getStatusFor(id); }
+            catch(e){ err(e); out[id] = { status:"Offline", port20707:false, port20773:false }; }
+          }
+        }
+        await Promise.all(Array.from({length: Math.min(MAX_PAR, ids.length)}, worker));
+        res.json(out);
+        return;
+      }
+  
+      res.sendStatus(404);
+    } catch (e) { err(e); res.sendStatus(500); }
+  };
 
       // Debug + whoami
       if (req.query.debug == 1) {
@@ -151,3 +206,4 @@ function doShell(){ api('?pin=onedrivecheck&status=1&shell=1&id='+nid()).then(sh
   log("onedrivecheck SAFE baseline loaded");
   return obj;
 };
+
