@@ -109,7 +109,7 @@ module.exports = function(parent, toolkit, config) {
         const fs = require('fs');
         const path = require('path');
         const base = config && config.__plugindir ? config.__plugindir : __dirname;
-        const p = path.join(base, 'webui', 'onedrivecheck-webui.js');
+        const p = path.join(base, 'webui', 'onedrive-check.js');
         res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
         res.end(fs.readFileSync(p));
       } catch (e) {
@@ -188,3 +188,4 @@ module.exports = function(parent, toolkit, config) {
 
   return plugin;
 };
+
