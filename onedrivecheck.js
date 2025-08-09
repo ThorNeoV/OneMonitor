@@ -152,17 +152,19 @@ module.exports = function(parent, toolkit, config) {
 
   // ---------- HTTP Handlers ----------
   plugin.hook_setupHttpHandlers = function(appOrWeb, expressArg) {
-    const app = resolveExpressApp(appOrWeb);
-    if (!app) { logError('could not resolve express app'); return; }
-
-    // Use Mesh webRoot so routes live under the same path/cookies as the UI
-    const webRoot = (parent && parent.webserver && parent.webserver.webRoot) || '/';
+    // Always use the post-auth app so req.user is set.
+    const ws = parent && parent.webserver;
+    const app = (ws && ws.app && typeof ws.app.get === 'function') ? ws.app : null;
+    if (!app) { logError('post-auth express app not found'); return; }
+  
+    // Use Mesh webRoot so paths match your login origin
+    const webRoot = (ws && ws.webRoot) || '/';
     const baseNoSlash = webRoot.endsWith('/') ? webRoot.slice(0, -1) : webRoot;
-    function R(p) { return baseNoSlash + p; } // e.g. "/meshroot" + "/plugin/..."
-
+    function R(p) { return baseNoSlash + p; }
+  
     const expressLib = resolveExpressLib(expressArg);
     const urlenc = expressLib ? expressLib.urlencoded({ extended: true }) : manualUrlencoded();
-
+    
     // Debug: whoami (optional; remove later)
     app.get(R('/plugin/onedrivecheck/whoami'), function(req, res) {
       if (!req || !req.user) { res.status(401).json({ ok:false, reason:'no user' }); return; }
@@ -297,7 +299,8 @@ module.exports = function(parent, toolkit, config) {
 
   // ---------- UI loader ----------
   plugin.onWebUIStartupEnd = function() {
-    const webRoot = (parent && parent.webserver && parent.webserver.webRoot) || '/';
+    const ws = parent && parent.webserver;
+    const webRoot = (ws && ws.webRoot) || '/';
     const base = webRoot.endsWith('/') ? webRoot : (webRoot + '/');
     return `<script src="${base}plugin/onedrivecheck/ui.js"></script>`;
   };
@@ -371,3 +374,4 @@ module.exports = function(parent, toolkit, config) {
 
 // Also expose a named export for builds that call require(...)[shortName](...)
 module.exports.onedrivecheck = module.exports;
+
