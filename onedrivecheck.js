@@ -50,10 +50,11 @@ module.exports.onedrivecheck = function (parent) {
 
   // ---------- auth helper
   function isAdmin(req) {
-    if (!req || !req.user) return false;
-    const u = req.user;
+      return !!(req && req.user);
+    //if (!req || !req.user) return false;
+    //const u = req.user;
     // Mesh sets siteadmin to a rights bitmask (number) for site-wide rights.
-    return !!(u.superuser || u.domainadmin || u.admin || u.isadmin || (u.siteadmin && (u.siteadmin | 0) !== 0));
+    //return !!(u.superuser || u.domainadmin || u.admin || u.isadmin || (u.siteadmin && (u.siteadmin | 0) !== 0));
   }
 
   // ---------- route registration
@@ -306,3 +307,4 @@ module.exports.onedrivecheck = function (parent) {
 
   return obj;
 };
+
