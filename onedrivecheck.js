@@ -1,25 +1,21 @@
 // OneDriveCheckService Monitor for MeshCentral
 // shortName: onedrivecheck
 //
-// Works across plugin API variants:
-// - If toolkit.config exists, uses it for settings/status; else falls back to files in plugin dir
-// - Resolves Express app regardless of whether webserver object or app is passed
-// - Exposes both default and named export (exports.onedrivecheck) for different loaders
-//
-// Endpoints:
-//   /plugin/onedrivecheck/admin
-//   /plugin/onedrivecheck/status?id=<nodeId>&id=<nodeId>
-//   /plugin/onedrivecheck/ui.js  (CSP-safe UI)
+// Compatible across MeshCentral variants:
+// - Uses toolkit.config if present, else falls back to files in the plugin dir
+// - Resolves the real Express app (or gracefully degrades)
+// - Provides both default export and named export (exports.onedrivecheck)
+// - Loads UI as external /plugin/onedrivecheck/ui.js (CSP safe)
 
 module.exports = function(parent, toolkit, config) {
   const plugin = this;
 
-  // ---------- Paths & storage fallbacks ----------
+  // ---------- Paths & storage ----------
   const fs = require('fs');
   const path = require('path');
   const plugindir = (config && config.__plugindir) ? config.__plugindir : __dirname;
 
-  // simple file-backed store (used if toolkit.config is unavailable)
+  // file-backed store fallback (used if toolkit.config is not available)
   const fileStore = {
     _read(name) {
       try { return JSON.parse(fs.readFileSync(path.join(plugindir, name), 'utf8')); } catch { return null; }
@@ -27,8 +23,7 @@ module.exports = function(parent, toolkit, config) {
     _write(name, obj) {
       try { fs.writeFileSync(path.join(plugindir, name), JSON.stringify(obj || {}, null, 2)); } catch (e) { logError(e); }
     },
-    async get(key, cb) {
-      // only keys we use: 'settings' and 'status:<nodeId>'
+    get(key, cb) {
       if (key === 'settings') {
         cb(this._read('settings.json') || null);
       } else if (key.startsWith('status:')) {
@@ -38,7 +33,7 @@ module.exports = function(parent, toolkit, config) {
         cb(null);
       }
     },
-    async set(key, val, cb) {
+    set(key, val, cb) {
       if (key === 'settings') {
         this._write('settings.json', val || {});
       } else if (key.startsWith('status:')) {
@@ -50,16 +45,15 @@ module.exports = function(parent, toolkit, config) {
     }
   };
 
-  // choose store
   const store = (toolkit && toolkit.config) ? toolkit.config : fileStore;
 
-  // ---------- Logging helpers ----------
+  // ---------- Logging ----------
   function logInfo(msg){ try { parent.info('onedrivecheck: ' + msg); } catch(_) {} }
   function logDebug(msg){ try { parent.debug('onedrivecheck: ' + msg); } catch(_) {} }
   function logError(err){ try { parent.debug('onedrivecheck error: ' + (err && err.stack || err)); } catch(_) {} }
 
   // ---------- Settings & status ----------
-  let settings = { meshId: null, pollInterval: 60 }; // seconds (min 10)
+  let settings = { meshId: null, pollInterval: 60 };
   let pollTimer = null;
 
   const statusKey = (id) => `status:${id}`;
@@ -109,21 +103,55 @@ module.exports = function(parent, toolkit, config) {
 </body></html>`;
   }
 
-  // ---------- HTTP handlers (robust to different args) ----------
+  // ---------- Express resolution & safe urlencoded ----------
   function resolveExpressApp(appOrWeb) {
-    // Try a bunch of common layouts
     if (!appOrWeb) return null;
-    if (typeof appOrWeb.get === 'function') return appOrWeb;                 // raw express app
+    if (typeof appOrWeb.get === 'function') return appOrWeb; // express app
     if (appOrWeb.app && typeof appOrWeb.app.get === 'function') return appOrWeb.app; // webserver.app
     if (parent && parent.webserver && parent.webserver.app && typeof parent.webserver.app.get === 'function') return parent.webserver.app;
     return null;
   }
+  function resolveExpressLib(expressArg) {
+    try {
+      if (expressArg && typeof expressArg.urlencoded === 'function') return expressArg;
+      if (parent && parent.webserver && parent.webserver.express && typeof parent.webserver.express.urlencoded === 'function') return parent.webserver.express;
+      const e = require('express');
+      if (e && typeof e.urlencoded === 'function') return e;
+    } catch(_) {}
+    return null;
+  }
+  function manualUrlencoded() {
+    // very small, safe fallback for application/x-www-form-urlencoded
+    return function(req, res, next) {
+      if (req.method !== 'POST') return next();
+      const ctype = (req.headers['content-type'] || '').toLowerCase();
+      if (ctype.indexOf('application/x-www-form-urlencoded') === -1) return next();
+      let data = '';
+      req.on('data', (d) => { data += d; if (data.length > 1e6) req.destroy(); });
+      req.on('end', () => {
+        const body = {};
+        data.split('&').forEach(p => {
+          if (!p) return;
+          const eq = p.indexOf('=');
+          const k = decodeURIComponent((eq === -1 ? p : p.substring(0, eq)).replace(/\+/g,' '));
+          const v = decodeURIComponent((eq === -1 ? '' : p.substring(eq+1)).replace(/\+/g,' '));
+          if (k) body[k] = v;
+        });
+        req.body = body;
+        next();
+      });
+    };
+  }
 
   const isAdminReq = (req) => !!(req && req.user && (req.user.siteadmin || req.user.domainadmin));
 
-  plugin.hook_setupHttpHandlers = function(appOrWeb, express) {
+  // ---------- HTTP Handlers ----------
+  plugin.hook_setupHttpHandlers = function(appOrWeb, expressArg) {
     const app = resolveExpressApp(appOrWeb);
     if (!app) { logError('could not resolve express app'); return; }
+
+    const expressLib = resolveExpressLib(expressArg);
+    const urlenc = expressLib ? expressLib.urlencoded({ extended: true }) : manualUrlencoded();
 
     // Admin UI
     app.get('/plugin/onedrivecheck/admin', function(req, res) {
@@ -132,10 +160,10 @@ module.exports = function(parent, toolkit, config) {
       res.end(adminHtml());
     });
 
-    app.post('/plugin/onedrivecheck/admin', express.urlencoded({ extended: true }), function(req, res) {
+    app.post('/plugin/onedrivecheck/admin', urlenc, function(req, res) {
       if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
-      if (typeof req.body.meshId === 'string') settings.meshId = req.body.meshId.trim();
-      if (req.body.pollInterval) settings.pollInterval = Math.max(10, parseInt(req.body.pollInterval, 10) || 60);
+      if (req.body && typeof req.body.meshId === 'string') settings.meshId = req.body.meshId.trim();
+      if (req.body && req.body.pollInterval) settings.pollInterval = Math.max(10, parseInt(req.body.pollInterval, 10) || 60);
       store.set('settings', settings, function() {
         logInfo('settings saved: ' + JSON.stringify(settings));
         schedulePolling(true);
@@ -150,7 +178,7 @@ module.exports = function(parent, toolkit, config) {
       let ids = req.query.id;
       if (!ids) { res.json({}); return; }
       if (!Array.isArray(ids)) ids = [ids];
-      let out = {};
+      const out = {};
       let pending = ids.length;
       ids.forEach((id) => {
         getStatus(id, function(v) {
@@ -296,6 +324,7 @@ module.exports = function(parent, toolkit, config) {
       for (const nodeId of ids) {
         const device = allDevices[nodeId];
         if (!device) continue;
+
         const osd = (device.osdesc || '').toLowerCase();
         if (!osd.includes('windows')) continue;
 
