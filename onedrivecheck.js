@@ -1,6 +1,6 @@
 "use strict";
 
-/** OneDriveCheck – UI via pluginadmin bridge (auth-safe, LIVE status) */
+/** OneDriveCheck – LIVE status + debug UI loader */
 module.exports.onedrivecheck = function (parent) {
   const obj = {};
   obj.parent = parent;
@@ -24,8 +24,8 @@ module.exports.onedrivecheck = function (parent) {
   }
 
   // ===== LIVE STATUS CHECKS =====
-  const CACHE_TTL_MS = 15000; // 15s
-  const cache = new Map(); // nodeId -> { t:number, val:{status,port20707,port20773} }
+  const CACHE_TTL_MS = 15000;
+  const cache = new Map(); // nodeId -> { t, val }
 
   function isAgentOnline(nodeId){
     try {
@@ -39,7 +39,7 @@ module.exports.onedrivecheck = function (parent) {
       if (!obj.meshServer || typeof obj.meshServer.sendCommand !== "function") { resolve(""); return; }
       const payload = { cmd, type: "powershell" };
       let done = false;
-      const timer = setTimeout(()=>{ if(!done){ done=true; resolve(""); } }, 6000); // 6s timeout
+      const timer = setTimeout(()=>{ if(!done){ done=true; resolve(""); } }, 6000);
       try {
         obj.meshServer.sendCommand(nodeId, "shell", payload, function (resp){
           if (done) return;
@@ -57,12 +57,8 @@ module.exports.onedrivecheck = function (parent) {
   function parseBool(s){ return /true/i.test(String(s||"")); }
 
   async function checkNodeLive(nodeId){
-    // If agent is offline, report Offline straight away
-    if (!isAgentOnline(nodeId)) {
-      return { status:"Offline", port20707:false, port20773:false };
-    }
+    if (!isAgentOnline(nodeId)) return { status:"Offline", port20707:false, port20773:false };
 
-    // Single PowerShell to test two ports and print simple CSV: "p1=true;p2=false"
     const ps = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ' +
       "\"$p1=(Test-NetConnection -ComputerName localhost -Port 20707 -WarningAction SilentlyContinue).TcpTestSucceeded; " +
       "$p2=(Test-NetConnection -ComputerName localhost -Port 20773 -WarningAction SilentlyContinue).TcpTestSucceeded; " +
@@ -72,30 +68,26 @@ module.exports.onedrivecheck = function (parent) {
     const m = /p1\s*=\s*(true|false).*?p2\s*=\s*(true|false)/i.exec(out||"");
     const p1 = m ? parseBool(m[1]) : false;
     const p2 = m ? parseBool(m[2]) : false;
-
     const status = p1 ? "App Online" : (p2 ? "Not signed in" : "Offline");
     return { status, port20707: !!p1, port20773: !!p2 };
   }
 
   async function getStatusFor(nodeId){
-    // cache
     const now = Date.now();
     const c = cache.get(nodeId);
     if (c && (now - c.t) < CACHE_TTL_MS) return c.val;
-
     const val = await checkNodeLive(nodeId);
     cache.set(nodeId, { t: now, val });
     return val;
   }
 
-  // ========== AUTHENTICATED BRIDGE ==========
+  // ========== AUTH BRIDGE ==========
   // /pluginadmin.ashx?pin=onedrivecheck&debug=1
   // /pluginadmin.ashx?pin=onedrivecheck&whoami=1
   // /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<nodeId>[&id=...]
   // /pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js
   obj.handleAdminReq = async function(req, res, user) {
     try {
-      // include UI
       if (req.query.include == 1) {
         const file = String(req.query.path||"").replace(/\\/g,"/").trim();
         if (file !== "ui.js") { res.sendStatus(404); return; }
@@ -122,7 +114,6 @@ module.exports.onedrivecheck = function (parent) {
         if (!Array.isArray(ids)) ids = [ids];
 
         const out = {};
-        // limit concurrency a bit
         const queue = ids.slice();
         const MAX_PAR = 5;
         async function worker(){
@@ -132,49 +123,45 @@ module.exports.onedrivecheck = function (parent) {
             catch(e){ err(e); out[id] = { status:"Offline", port20707:false, port20773:false }; }
           }
         }
-        const workers = Array.from({length: Math.min(MAX_PAR, ids.length)}, worker);
-        await Promise.all(workers);
-
+        await Promise.all(Array.from({length: Math.min(MAX_PAR, ids.length)}, worker));
         res.json(out);
         return;
       }
 
       res.sendStatus(404);
-    } catch (e) {
-      err(e); res.sendStatus(500);
-    }
+    } catch (e) { err(e); res.sendStatus(500); }
   };
 
-  // Inject UI script everywhere
+  // Inject UI script everywhere (cache-busted)
   obj.onWebUIStartupEnd = function () {
     const v = (Date.now() % 1e6);
     return `<script src="/pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js&v=${v}"></script>`;
   };
 
-  // --------- Client JS (column + device pill; robust selectors/observers)
+  // --------- Client JS with DEBUG beacons
   function buildClientJS(){
-    return `(function(){
-  "use strict";
+    return `(()=>{"use strict";
+  const DBG=(...a)=>{ try{ console.log("%c[ODC]", "color:#06c;font-weight:700", ...a);}catch{} };
+  DBG("ui boot");
 
-  function badge(){
-    var bar = document.getElementById('deviceToolbar') ||
-              document.querySelector('.DeviceToolbar') ||
-              document.querySelector('#Toolbar') ||
-              document.querySelector('#devicestoolbar') ||
-              document.querySelector('.TopBar');
-    if(!bar || document.getElementById('odc-badge')) return;
-    var b=document.createElement('span');
-    b.id='odc-badge';
-    b.textContent='ODC';
-    b.style.marginLeft='8px'; b.style.padding='2px 6px';
-    b.style.border='1px solid #999'; b.style.borderRadius='6px';
-    b.style.fontWeight='600'; b.style.fontSize='12px';
-    bar.appendChild(b);
+  // Always paint a tiny floating chip so we know the script loaded
+  function chip(){
+    if(document.getElementById("odc-chip")) return;
+    const d=document.createElement("div");
+    d.id="odc-chip";
+    d.textContent="ODC running";
+    Object.assign(d.style,{
+      position:"fixed", right:"10px", bottom:"10px", padding:"2px 6px",
+      background:"#eef", border:"1px solid #99c", borderRadius:"8px",
+      fontSize:"12px", fontWeight:"600", zIndex:"2147483647"
+    });
+    document.body.appendChild(d);
   }
 
   function apiStatus(ids){
-    var url = '/pluginadmin.ashx?pin=onedrivecheck&status=1' + ids.map(function(id){ return '&id='+encodeURIComponent(id); }).join('');
-    return fetch(url, { credentials:'same-origin' }).then(function(r){ return r.json(); }).catch(function(){ return {}; });
+    const url = '/pluginadmin.ashx?pin=onedrivecheck&status=1' + ids.map(id=>'&id='+encodeURIComponent(id)).join('');
+    return fetch(url, { credentials:'same-origin' })
+      .then(r=>r.json()).catch(()=>({}));
   }
 
   // ===== Device List =====
@@ -182,7 +169,8 @@ module.exports.onedrivecheck = function (parent) {
     return document.querySelector('#devices') ||
            document.querySelector('#devicesTable') ||
            document.querySelector('table#devicetable') ||
-           document.querySelector('table[data-list="devices"]');
+           document.querySelector('table[data-list="devices"]') ||
+           document.querySelector('table');
   }
   function rowId(row){
     return row.getAttribute('deviceid') || row.dataset.deviceid ||
@@ -191,39 +179,40 @@ module.exports.onedrivecheck = function (parent) {
            null;
   }
   function addHeader(){
-    var g=table(); if(!g) return false;
-    var thead=g.querySelector('thead'); if(!thead) return false;
-    var tr=thead.querySelector('tr'); if(!tr) return false;
+    const g=table(); if(!g) return false;
+    const thead=g.querySelector('thead'); if(!thead) return false;
+    const tr=thead.querySelector('tr'); if(!tr) return false;
     if(!document.getElementById('col_onedrivecheck')){
-      var th=document.createElement('th'); th.id='col_onedrivecheck'; th.textContent='OneDriveCheck';
+      const th=document.createElement('th'); th.id='col_onedrivecheck'; th.textContent='OneDriveCheck';
       th.style.whiteSpace='nowrap';
       tr.appendChild(th);
+      DBG("added header");
     }
     return true;
   }
   function ensureCells(){
-    var g=table(); if(!g) return [];
-    var tbody=g.querySelector('tbody'); if(!tbody) return [];
-    var rows=tbody.querySelectorAll('tr'); var ids=[];
-    rows.forEach(function(r){
+    const g=table(); if(!g) return [];
+    const tbody=g.querySelector('tbody'); if(!tbody) return [];
+    const rows=tbody.querySelectorAll('tr'); const ids=[];
+    rows.forEach(r=>{
       if(!r.querySelector('.onedrivecheck-cell')){
-        var td=document.createElement('td'); td.className='onedrivecheck-cell'; td.textContent='—';
+        const td=document.createElement('td'); td.className='onedrivecheck-cell'; td.textContent='—';
         td.style.whiteSpace='nowrap';
         r.appendChild(td);
       }
-      var id=rowId(r); if(id) ids.push(id);
+      const id=rowId(r); if(id) ids.push(id);
     });
     return ids;
   }
   function paintList(map){
-    var g=table(); if(!g) return;
-    g.querySelectorAll('tbody tr').forEach(function(r){
-      var id=rowId(r); var td=r.querySelector('.onedrivecheck-cell'); if(!td) return;
-      var s=(id && map && map[id])?map[id]:null;
+    const g=table(); if(!g) return;
+    g.querySelectorAll('tbody tr').forEach(r=>{
+      const id=rowId(r); const td=r.querySelector('.onedrivecheck-cell'); if(!td) return;
+      const s=(id && map && map[id])?map[id]:null;
       if(!s){ td.textContent='—'; td.dataset.state=''; td.title=''; td.style.color=''; td.style.fontWeight=''; return; }
       td.textContent = s.status || '—';
       td.title = '20707:'+(s.port20707?'open':'closed')+', 20773:'+(s.port20773?'open':'closed');
-      var state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
+      const state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
       td.dataset.state = state;
       td.style.color = (state==='online'?'#0a0':(state==='notsigned'?'#b80':'#c00'));
       td.style.fontWeight = '600';
@@ -231,64 +220,69 @@ module.exports.onedrivecheck = function (parent) {
   }
   function tickList(){
     if(!addHeader()) return;
-    var ids=ensureCells(); if(ids.length===0) return;
+    const ids=ensureCells(); if(ids.length===0) return;
+    DBG("list ids", ids.length);
     apiStatus(ids).then(paintList);
   }
 
   // ===== Device Page =====
   function currentNodeId(){
-    var explicit = document.querySelector('[data-nodeid]'); if (explicit && explicit.dataset.nodeid) return explicit.dataset.nodeid;
-    var info = document.getElementById('deviceInfo'); if(info && info.dataset && info.dataset.nodeid) return info.dataset.nodeid;
-    var h=location.hash||''; var m=h.match(/nodeid=([^&]+)/i); return m?decodeURIComponent(m[1]):null;
+    const explicit = document.querySelector('[data-nodeid]'); if (explicit && explicit.dataset.nodeid) return explicit.dataset.nodeid;
+    const info = document.getElementById('deviceInfo'); if(info && info.dataset && info.dataset.nodeid) return info.dataset.nodeid;
+    const h=location.hash||''; const m=h.match(/nodeid=([^&]+)/i); return m?decodeURIComponent(m[1]):null;
   }
   function ensureDevicePill(){
-    var host = document.querySelector('#p11') || document.querySelector('#p1') ||
-               document.getElementById('deviceInfo') || document.querySelector('.DeviceInfo') ||
-               document.getElementById('deviceSummary') || document.querySelector('.General') ||
-               document.querySelector('#p10');
+    const host = document.querySelector('#p11') || document.querySelector('#p1') ||
+                 document.getElementById('deviceInfo') || document.querySelector('.DeviceInfo') ||
+                 document.getElementById('deviceSummary') || document.querySelector('.General') ||
+                 document.querySelector('#p10') || document.querySelector('#p00');
     if(!host) return null;
-    var id='onedrivecheck-pill';
-    var pill=document.getElementById(id);
+    const id='onedrivecheck-pill';
+    let pill=document.getElementById(id);
     if(!pill){
       pill=document.createElement('div'); pill.id=id;
       pill.style.marginTop='6px'; pill.style.fontWeight='600';
       host.appendChild(pill);
+      DBG("added device pill");
     }
     return pill;
   }
   function paintDevice(map){
-    var id=currentNodeId(); if(!id) return;
-    var s=map[id]; var pill=ensureDevicePill(); if(!pill) return;
+    const id=currentNodeId(); if(!id) return;
+    const s=map[id]; const pill=ensureDevicePill(); if(!pill) return;
     if(!s){ pill.textContent='OneDriveCheck: —'; pill.style.color='#666'; return; }
-    var state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
+    const state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
     pill.textContent='OneDriveCheck: ' + (s.status||'—') + '  (20707:'+(s.port20707?'open':'closed')+', 20773:'+(s.port20773?'open':'closed')+')';
     pill.style.color = (state==='online'?'#0a0':(state==='notsigned'?'#b80':'#c00'));
   }
   function tickDevice(){
-    var id=currentNodeId(); if(!id) return;
+    const id=currentNodeId(); if(!id) return;
+    DBG("device id", id);
     apiStatus([id]).then(paintDevice);
   }
 
-  function onNav(){ setTimeout(function(){ badge(); tickList(); tickDevice(); }, 250); }
+  function onNav(){ setTimeout(()=>{ chip(); tickList(); tickDevice(); }, 250); }
   window.addEventListener('hashchange', onNav);
 
   document.addEventListener('DOMContentLoaded', function(){
-    onNav();
-    var root = document.getElementById('Content') || document.body;
+    DBG("dom ready");
+    chip(); onNav();
+    const root = document.getElementById('Content') || document.body;
     try {
-      var mo = new MutationObserver(function(){ tickList(); });
+      const mo = new MutationObserver(()=>{ tickList(); });
       mo.observe(root, { childList:true, subtree:true });
-    } catch (e) {}
+      DBG("observer attached");
+    } catch (e) { DBG("observer error", e); }
   });
 
   setInterval(function(){
-    badge();
+    chip();
     if (table() && !document.getElementById('col_onedrivecheck')) tickList();
     tickDevice();
   }, 6000);
 })();`;
   }
 
-  log("onedrivecheck loaded (pluginadmin-only UI; LIVE checks with caching)");
+  log("onedrivecheck loaded (debug UI)");
   return obj;
 };
