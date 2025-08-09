@@ -1,10 +1,10 @@
 // OneDriveCheckService Monitor for MeshCentral
 // shortName: onedrivecheck
 //
-// Minimal two-file plugin (no webui folder).
-// - Admin page at  /plugin/onedrivecheck/admin
-// - Status API at   /plugin/onedrivecheck/status
-// - UI is injected inline via onWebUIStartupEnd()
+// Single-file plugin:
+//  - Admin page:  /plugin/onedrivecheck/admin
+//  - Status API:  /plugin/onedrivecheck/status?id=<nodeId>&id=<nodeId>
+//  - UI script:   /plugin/onedrivecheck/ui.js  (linked via onWebUIStartupEnd)
 
 module.exports = function(parent, toolkit, config) {
   const plugin = this;
@@ -14,27 +14,37 @@ module.exports = function(parent, toolkit, config) {
   let settings = { meshId: null, pollInterval: 60 }; // seconds (min 10)
   let pollTimer = null;
 
-  // ---- Per-device status persistence --------------------------------------
+  // ---- Helpers -------------------------------------------------------------
+  const isAdminReq = (req) => !!(req && req.user && (req.user.siteadmin || req.user.domainadmin));
+
   const statusKey = (id) => `status:${id}`;
   function saveStatus(deviceId, obj, cb) {
+    try { obj = obj || {}; obj.lastChecked = Date.now(); } catch(_) {}
     toolkit.config.set(statusKey(deviceId), obj, () => cb && cb());
   }
   function getStatus(deviceId, cb) {
     toolkit.config.get(statusKey(deviceId), (v) => cb && cb(v || null));
   }
 
+  function logInfo(msg){ try { parent.info('onedrivecheck: ' + msg); } catch(_) {} }
+  function logDebug(msg){ try { parent.debug('onedrivecheck: ' + msg); } catch(_) {} }
+  function logError(err){ try { parent.debug('onedrivecheck error: ' + (err && err.stack || err)); } catch(_) {} }
+
   // ---- Startup -------------------------------------------------------------
   plugin.server_startup = function() {
+    logInfo('server_startup');
     toolkit.config.get('settings', function(val) {
       if (val) settings = Object.assign(settings, val);
+      logInfo('settings=' + JSON.stringify(settings));
       schedulePolling(true);
     });
   };
 
   function schedulePolling(forceRunNow) {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-    if (!settings.meshId) return;
+    if (!settings.meshId) { logInfo('no meshId set; not polling'); return; }
     const intervalMs = Math.max(10, parseInt(settings.pollInterval || 60, 10)) * 1000;
+    logInfo('polling every ' + (intervalMs / 1000) + 's');
     pollTimer = setInterval(pollDevices, intervalMs);
     if (forceRunNow) pollDevices();
   }
@@ -64,25 +74,26 @@ module.exports = function(parent, toolkit, config) {
   plugin.hook_setupHttpHandlers = function(app, express) {
     // Admin UI
     app.get('/plugin/onedrivecheck/admin', function(req, res) {
-      if (!req.user || !req.user.siteadmin) { res.status(403).end('Forbidden'); return; }
+      if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       res.end(adminHtml());
     });
 
     app.post('/plugin/onedrivecheck/admin', express.urlencoded({ extended: true }), function(req, res) {
-      if (!req.user || !req.user.siteadmin) { res.status(403).end('Forbidden'); return; }
+      if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
       if (typeof req.body.meshId === 'string') settings.meshId = req.body.meshId.trim();
       if (req.body.pollInterval) settings.pollInterval = Math.max(10, parseInt(req.body.pollInterval, 10) || 60);
       toolkit.config.set('settings', settings, function() {
+        logInfo('settings saved: ' + JSON.stringify(settings));
         schedulePolling(true);
         res.writeHead(302, { Location: '/plugin/onedrivecheck/admin' });
         res.end();
       });
     });
 
-    // Status API: /plugin/onedrivecheck/status?id=<nodeId>&id=<nodeId>...
+    // Status API
     app.get('/plugin/onedrivecheck/status', function(req, res) {
-      if (!req.user || !req.user.siteadmin) { res.status(403).end('Forbidden'); return; }
+      if (!isAdminReq(req)) { res.status(403).end('Forbidden'); return; }
       let ids = req.query.id;
       if (!ids) { res.json({}); return; }
       if (!Array.isArray(ids)) ids = [ids];
@@ -96,137 +107,103 @@ module.exports = function(parent, toolkit, config) {
         });
       });
     });
-  };
 
-  // ---- UI Injection (inline; no separate webui file needed) ----------------
-  plugin.onWebUIStartupEnd = function() {
-    // This script adds the OneDriveCheck column & filter, and fetches statuses.
-    return `
-<script>
-(function(){
-  function getRowDeviceId(row) {
-    return row.getAttribute('deviceid') ||
-           row.dataset.deviceid ||
+    // UI JS (CSP-safe: external script)
+    app.get('/plugin/onedrivecheck/ui.js', function(req, res) {
+      if (!req.user) { res.status(403).end('Forbidden'); return; }
+      const js = `(function(){
+  function queryDevicesTable(){ return document.querySelector('#devices, #devicesTable'); }
+  function getRowDeviceId(row){
+    return row.getAttribute('deviceid') || row.dataset.deviceid ||
            (row.id && row.id.startsWith('d_') ? row.id.substring(2) : null) ||
-           row.getAttribute('nodeid') ||
-           row.dataset.nodeid || null;
+           row.getAttribute('nodeid') || row.dataset.nodeid || null;
   }
-
-  function addColumnHeader() {
-    var grid = document.getElementById('devices');
-    if (!grid) return false;
-    var thead = grid.querySelector('thead');
-    if (!thead) return false;
-    var tr = thead.querySelector('tr');
-    if (!tr) return false;
-    if (!document.getElementById('col_onedrivecheck')) {
-      var th = document.createElement('th');
-      th.id = 'col_onedrivecheck';
-      th.textContent = 'OneDriveCheck';
-      tr.appendChild(th);
+  function addColumnHeader(){
+    var grid = queryDevicesTable(); if(!grid) return false;
+    var thead = grid.querySelector('thead'); if(!thead) return false;
+    var tr = thead.querySelector('tr'); if(!tr) return false;
+    if(!document.getElementById('col_onedrivecheck')){
+      var th = document.createElement('th'); th.id='col_onedrivecheck'; th.textContent='OneDriveCheck'; tr.appendChild(th);
     }
     return true;
   }
-
-  function ensureCells() {
-    var grid = document.getElementById('devices');
-    if (!grid) return [];
-    var rows = grid.querySelectorAll('tbody tr');
-    var ids = [];
+  function ensureCells(){
+    var grid = queryDevicesTable(); if(!grid) return [];
+    var rows = grid.querySelectorAll('tbody tr'); var ids = [];
     rows.forEach(function(row){
-      if (!row.querySelector('.onedrivecheck-cell')) {
-        var td = document.createElement('td');
-        td.className = 'onedrivecheck-cell';
-        td.textContent = '—';
-        row.appendChild(td);
+      if(!row.querySelector('.onedrivecheck-cell')){
+        var td = document.createElement('td'); td.className='onedrivecheck-cell'; td.textContent='—'; row.appendChild(td);
       }
-      var id = getRowDeviceId(row);
-      if (id) ids.push(id);
+      var id = getRowDeviceId(row); if(id) ids.push(id);
     });
     return ids;
   }
-
-  function paintRows(statusMap) {
-    var rows = document.querySelectorAll('#devices tbody tr');
+  function paintRows(statusMap){
+    var grid = queryDevicesTable(); if(!grid) return;
+    var rows = grid.querySelectorAll('tbody tr');
     rows.forEach(function(row){
       var id = getRowDeviceId(row);
-      var td = row.querySelector('.onedrivecheck-cell');
-      if (!td) return;
+      var td = row.querySelector('.onedrivecheck-cell'); if(!td) return;
       var s = (id && statusMap && statusMap[id]) ? statusMap[id] : null;
-      if (!s) { td.textContent = '—'; td.dataset.state = ''; td.title = ''; return; }
+      if(!s){ td.textContent='—'; td.dataset.state=''; td.title=''; return; }
       td.textContent = s.status || '—';
       td.title = '20707:' + (s.port20707 ? 'open' : 'closed') + ', 20773:' + (s.port20773 ? 'open' : 'closed');
       td.dataset.state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
     });
   }
-
-  function fetchStatus(ids) {
-    if (!ids || ids.length === 0) return Promise.resolve({});
-    var url = '/plugin/onedrivecheck/status?' + ids.map(function(id){ return 'id=' + encodeURIComponent(id); }).join('&');
-    return fetch(url, { credentials: 'same-origin' }).then(function(r){ return r.json(); }).catch(function(){ return {}; });
+  function fetchStatus(ids){
+    if(!ids || ids.length===0) return Promise.resolve({});
+    var url = '/plugin/onedrivecheck/status?' + ids.map(function(id){ return 'id='+encodeURIComponent(id); }).join('&');
+    return fetch(url, { credentials:'same-origin' }).then(function(r){ return r.json(); }).catch(function(){ return {}; });
   }
-
-  function applyFilter() {
-    var sel = document.getElementById('filter_onedrivecheck');
-    if (!sel) return;
+  function applyFilter(){
+    var sel = document.getElementById('filter_onedrivecheck'); if(!sel) return;
     var mode = sel.value;
-    var rows = document.querySelectorAll('#devices tbody tr');
+    var grid = queryDevicesTable(); if(!grid) return;
+    var rows = grid.querySelectorAll('tbody tr');
     rows.forEach(function(r){
-      var td = r.querySelector('.onedrivecheck-cell');
-      var state = td ? td.dataset.state : '';
+      var td = r.querySelector('.onedrivecheck-cell'); var state = td ? td.dataset.state : '';
       var show = true;
-      if (mode === 'offline')   show = (state === 'offline');
-      if (mode === 'notsigned') show = (state === 'notsigned');
-      if (mode === 'online')    show = (state === 'online');
+      if(mode==='offline')   show = (state==='offline');
+      if(mode==='notsigned') show = (state==='notsigned');
+      if(mode==='online')    show = (state==='online');
       r.style.display = show ? '' : 'none';
     });
   }
-
-  function addFilterUI() {
-    var bar = document.getElementById('deviceToolbar') || document.querySelector('.DeviceToolbar') || document.querySelector('#Toolbar');
-    if (!bar) return;
-    if (document.getElementById('filter_onedrivecheck')) return;
-    var label = document.createElement('span');
-    label.style.marginLeft = '10px';
-    label.textContent = 'OneDriveCheck: ';
-    var sel = document.createElement('select');
-    sel.id = 'filter_onedrivecheck';
-    var opts = [
-      {v:'all',      t:'All'},
-      {v:'offline',  t:'App Offline (20707 closed & 20773 closed)'},
-      {v:'notsigned',t:'Not signed in (20773 open)'},
-      {v:'online',   t:'Online (20707 open)'}
-    ];
-    opts.forEach(function(o){
-      var opt = document.createElement('option'); opt.value = o.v; opt.text = o.t; sel.appendChild(opt);
-    });
-    sel.onchange = applyFilter;
-    bar.appendChild(label);
-    bar.appendChild(sel);
+  function addFilterUI(){
+    var bar = document.getElementById('deviceToolbar') || document.querySelector('.DeviceToolbar') || document.querySelector('#Toolbar') || document.querySelector('#devicestoolbar');
+    if(!bar) return; if(document.getElementById('filter_onedrivecheck')) return;
+    var label = document.createElement('span'); label.style.marginLeft='10px'; label.textContent='OneDriveCheck: ';
+    var sel = document.createElement('select'); sel.id='filter_onedrivecheck';
+    [{v:'all',t:'All'},{v:'offline',t:'App Offline (20707 closed & 20773 closed)'},{v:'notsigned',t:'Not signed in (20773 open)'},{v:'online',t:'Online (20707 open)'}]
+      .forEach(function(o){ var opt=document.createElement('option'); opt.value=o.v; opt.text=o.t; sel.appendChild(opt); });
+    sel.onchange = applyFilter; bar.appendChild(label); bar.appendChild(sel);
   }
-
-  function refreshNow() {
-    if (!addColumnHeader()) return;
+  function refreshNow(){
+    if(!addColumnHeader()) return;
     addFilterUI();
     var ids = ensureCells();
-    fetchStatus(ids).then(function(map){
-      paintRows(map);
-      applyFilter();
-    });
+    fetchStatus(ids).then(function(map){ paintRows(map); applyFilter(); });
   }
-
   document.addEventListener('meshcentralDeviceListRefreshEnd', refreshNow);
   document.addEventListener('DOMContentLoaded', function(){ setTimeout(refreshNow, 500); });
   setInterval(function(){
-    var grid = document.getElementById('devices');
-    if (grid && !document.getElementById('col_onedrivecheck')) refreshNow();
+    var grid = queryDevicesTable();
+    if(grid && !document.getElementById('col_onedrivecheck')) refreshNow();
   }, 4000);
-})();
-</script>`;
+})();`;
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+      res.end(js);
+    });
+  };
+
+  // ---- UI loader (injects external JS) ------------------------------------
+  plugin.onWebUIStartupEnd = function() {
+    return `<script src="/plugin/onedrivecheck/ui.js"></script>`;
   };
 
   // ---- Polling logic -------------------------------------------------------
-  // Safer device enumeration across MC builds: read nodes from DB & filter by meshid.
+  // Device enumeration that works across builds: read nodes from DB & filter by meshid.
   function getDevicesInMesh(meshId) {
     return new Promise((resolve) => {
       try {
@@ -237,19 +214,15 @@ module.exports = function(parent, toolkit, config) {
           });
           resolve(map);
         });
-      } catch (e) {
-        resolve({});
-      }
+      } catch (e) { logError(e); resolve({}); }
     });
   }
 
   function sendShell(deviceId, cmd) {
     return new Promise((resolve) => {
-      // Many builds expose parent.sendCommand(nodeId, 'shell', payload, cb)
-      // If your build differs, I can adjust.
       const payload = { cmd: cmd, type: 'powershell' };
+      // parent.sendCommand(nodeId, 'shell', payload, cb)
       parent.sendCommand(deviceId, 'shell', payload, function(resp) {
-        // resp.data is agent stdout (string/Buffer)
         resolve(resp && resp.data ? String(resp.data) : '');
       });
     });
@@ -264,7 +237,7 @@ module.exports = function(parent, toolkit, config) {
   async function restartService(deviceId) {
     const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Try { Restart-Service -Name OneDriveCheckService -Force -ErrorAction Stop; 'OK' } Catch { 'ERR:' + $_ }"`;
     await sendShell(deviceId, cmd);
-    try { parent.debug('onedrivecheck: Restarted OneDriveCheckService on ' + deviceId); } catch (e) {}
+    logDebug('Restarted OneDriveCheckService on ' + deviceId);
   }
 
   async function pollDevices() {
@@ -286,8 +259,7 @@ module.exports = function(parent, toolkit, config) {
         const status = {
           status: (port20707 ? 'App Online' : (port20773 ? 'Not signed in' : 'Offline')),
           port20707: !!port20707,
-          port20773: !!port20773,
-          lastChecked: Date.now()
+          port20773: !!port20773
         };
 
         saveStatus(nodeId, status);
@@ -297,9 +269,7 @@ module.exports = function(parent, toolkit, config) {
           await restartService(nodeId);
         }
       }
-    } catch (err) {
-      try { parent.debug('onedrivecheck poll error: ' + (err && err.stack || err)); } catch (e) {}
-    }
+    } catch (err) { logError(err); }
   }
 
   return plugin;
