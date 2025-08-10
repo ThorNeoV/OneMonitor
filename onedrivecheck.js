@@ -1,15 +1,16 @@
 "use strict";
 
 /**
- * OneDriveCheck – SAFE BASELINE (admin bridge only)
+ * OneDriveCheck – SAFE BASELINE (admin bridge only, fast CMD probe)
+ *
  * Endpoints (use while logged in):
  *  - /pluginadmin.ashx?pin=onedrivecheck&whoami=1
  *  - /pluginadmin.ashx?pin=onedrivecheck&debug=1
- *  - /pluginadmin.ashx?pin=onedrivecheck&apiguess=1
  *  - /pluginadmin.ashx?pin=onedrivecheck&listonline=1
  *  - /pluginadmin.ashx?pin=onedrivecheck&echoshell=1&id=<id or node//id>
- *  - /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<id>[&id=...]          (agent presence only)
- *  - /pluginadmin.ashx?pin=onedrivecheck&status=1&shell=1&id=<id>[&id=...]   (PowerShell probes ports 20707/20773)
+ *  - /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<id>[&id=...]                (agent presence only)
+ *  - /pluginadmin.ashx?pin=onedrivecheck&status=1&shell=1&id=<id>[&id=...]         (CMD netstat probes 20707/20773)
+ *  - /pluginadmin.ashx?pin=onedrivecheck&cmdprobe=1&id=<id>                        (runs the raw netstat probe; debug helper)
  */
 
 module.exports.onedrivecheck = function (parent) {
@@ -17,14 +18,14 @@ module.exports.onedrivecheck = function (parent) {
   obj.parent = parent;
   obj.meshServer = parent.parent;
 
-  // Some Mesh builds only call known hooks when listed:
+  // Some Mesh builds only call known hooks when listed.
   obj.exports = ["handleAdminReq"];
 
   // --- logging
   const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{ console.log("onedrivecheck:", m); } };
   const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{ console.error("onedrivecheck error:", e); } };
 
-  // --- small helpers
+  // --- helpers
   const summarizeUser = (u)=> u ? ({ name:u.name, userid:u.userid, domain:u.domain, siteadmin:u.siteadmin }) : null;
   const parseBool = (v)=> /^true$/i.test(String(v).trim());
 
@@ -42,7 +43,7 @@ module.exports.onedrivecheck = function (parent) {
   }
 
   function listOnline() {
-    const a = (obj.meshServer && obj.meshServer.webserver && obj.meshServer.webserver.wsagents) || {};
+    const a = (obj.meshServer.webserver && obj.meshServer.webserver.wsagents) || {};
     const out = {};
     for (const k of Object.keys(a)) {
       try {
@@ -57,151 +58,94 @@ module.exports.onedrivecheck = function (parent) {
     return out;
   }
 
-  // ---------- Agent socket access ----------
-  function getWsAgent(nodeId){
-    try { return obj.meshServer && obj.meshServer.webserver && obj.meshServer.webserver.wsagents && obj.meshServer.webserver.wsagents[nodeId]; }
-    catch { return null; }
-  }
-
-  // Minimal per-request reply hook on the agent websocket
-  function installAgentReplyHook(nodeId, corrTag, onReply, timeoutMs){
-    const ws = getWsAgent(nodeId);
-    if (!ws || !ws.on) return ()=>{};
-    let finished = false;
-
-    function handler(msg){
-      if (finished) return;
-      let o;
-      try { o = JSON.parse(String(msg)); } catch { return; }
-      // We key on a private correlation tag we include in the request
-      if (o && o._odcTag === corrTag) {
-        finished = true;
-        try { ws.removeListener('message', handler); } catch {}
-        onReply(o);
+  function sendShell(nodeId, cmd) {
+    return new Promise((resolve) => {
+      if (!obj.meshServer || typeof obj.meshServer.sendCommand !== "function") {
+        resolve({ ok:false, reason:"no_sendCommand" });
+        return;
       }
-    }
-    try { ws.on('message', handler); } catch {}
-    const cancel = ()=>{
-      if (finished) return;
-      finished = true;
-      try { ws.removeListener('message', handler); } catch {}
-    };
-    setTimeout(cancel, timeoutMs || 9000);
-    return cancel;
-  }
-
-  // Direct socket send fallback (agent shell via "shell" action)
-  function directShell(nodeId, cmd){
-    return new Promise((resolve)=>{
-      const ws = getWsAgent(nodeId);
-      if (!ws || !ws.send) { resolve(""); return; }
-
-      const corrTag = 'odc_' + Math.random().toString(36).slice(2);
-      const cancel = installAgentReplyHook(nodeId, corrTag, (reply)=>{
-        const s = (reply && (reply.data || reply.value || reply.output || "")) || "";
-        resolve(String(s));
-      }, 9000);
-
-      const message = {
-        action: 'shell',
-        type: 'cmd',
-        cmd: cmd,
-        _odcTag: corrTag
-      };
-
-      try { ws.send(JSON.stringify(message)); } catch { cancel(); resolve(""); }
+      const payload = { cmd, type: "cmd" }; // Force CMD channel
+      let done = false;
+      const timer = setTimeout(() => {
+        if (!done) { done = true; resolve({ ok:false, reason:"timeout" }); }
+      }, 8000);
+      try {
+        obj.meshServer.sendCommand(nodeId, "shell", payload, function (resp) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          const data = (resp && typeof resp.data === "string") ? resp.data : "";
+          resolve({ ok:true, data });
+        });
+      } catch (e) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve({ ok:false, reason:String(e && e.message || e || "send_error") });
+      }
     });
   }
 
-  // Main sendShell shim — tries several APIs, then falls back to direct socket
-  function sendShell(nodeId, cmd){
-    return new Promise((resolve)=>{
-      const done = (s)=>resolve(s==null?"":String(s));
+  // Fast local port probe using CMD (no quotes in findstr to avoid escaping issues)
+  const NETSTAT_PROBE =
+    '(netstat -an | findstr /C::20707 >nul && echo p1=True || echo p1=False) & ' +
+    '(netstat -an | findstr /C::20773 >nul && echo p2=True || echo p2=False)';
 
-      // Try modern camelCase API
-      if (obj.meshServer && typeof obj.meshServer.sendCommand === 'function') {
-        try {
-          obj.meshServer.sendCommand(nodeId, 'shell', { cmd, type: 'cmd' }, (resp)=>{
-            return done(resp && (resp.data || resp.value || resp.output || ""));
-          });
-          return;
-        } catch {}
-      }
-      // Try older PascalCase API
-      if (obj.meshServer && typeof obj.meshServer.SendCommand === 'function') {
-        try {
-          obj.meshServer.SendCommand(nodeId, 'shell', { cmd, type: 'cmd' }, (resp)=>{
-            return done(resp && (resp.data || resp.value || resp.output || ""));
-          });
-          return;
-        } catch {}
-      }
-
-      // Last resort: direct socket to the agent with our reply hook
-      directShell(nodeId, cmd).then(done);
-    });
-  }
-
-  async function liveCheckWindows(nodeId) {
-    // Launch PowerShell *through* cmd so the agent's shell type doesn't matter
-    const psCmd =
-      'powershell -NoProfile -ExecutionPolicy Bypass -Command ' +
-      '"$p1=(Test-NetConnection -ComputerName localhost -Port 20707 -WarningAction SilentlyContinue).TcpTestSucceeded; ' +
-      '$p2=(Test-NetConnection -ComputerName localhost -Port 20773 -WarningAction SilentlyContinue).TcpTestSucceeded; ' +
-      'Write-Output (\'p1=\' + $p1 + \';p2=\' + $p2)"';
-
-    const out = await sendShell(nodeId, `cmd /c ${psCmd}`);
-    log(`onedrivecheck shell out (${nodeId}): ${out}`);
-
-    const m = /p1\s*=\s*(true|false).*?p2\s*=\s*(true|false)/i.exec(out || "");
-    const p1 = m ? parseBool(m[1]) : false;
-    const p2 = m ? parseBool(m[2]) : false;
+  async function probePortsCMD(nodeId){
+    const res = await sendShell(nodeId, `cmd /c ${NETSTAT_PROBE}`);
+    const raw = (res && res.ok && res.data) ? res.data : "";
+    // Accept output with possible spacing/newlines
+    const m1 = /p1\s*=\s*(true|false)/i.exec(raw);
+    const m2 = /p2\s*=\s*(true|false)/i.exec(raw);
+    const p1 = m1 ? parseBool(m1[1]) : false;
+    const p2 = m2 ? parseBool(m2[1]) : false;
     const status = p1 ? "App Online" : (p2 ? "Not signed in" : "Offline");
-    return { status, port20707: !!p1, port20773: !!p2, raw: out ? out.trim() : "" };
+    return { status, port20707: !!p1, port20773: !!p2, raw: raw.trim(), meta: res.ok ? "ok" : (res && res.reason || "no_output") };
   }
 
-  // ---------- Admin bridge ----------
+  // --- admin bridge only
   obj.handleAdminReq = async function (req, res, user) {
     try {
+      // Debug / WhoAmI / Online
       if (req.query.debug == 1) {
         res.json({ ok:true, via:"handleAdminReq", hasUser:!!user, user:summarizeUser(user), hasSession:!!(req && req.session) });
         return;
       }
-
-      if (req.query.apiguess == 1) {
-        const api = {
-          has_meshServer: !!obj.meshServer,
-          sendCommand: !!(obj.meshServer && obj.meshServer.sendCommand),
-          SendCommand: !!(obj.meshServer && obj.meshServer.SendCommand),
-          DispatchEvent: !!(obj.meshServer && obj.meshServer.DispatchEvent),
-          wsagents: !!(obj.meshServer && obj.meshServer.webserver && obj.meshServer.webserver.wsagents)
-        };
-        res.json({ ok:true, api });
-        return;
-      }
-
       if (req.query.whoami == 1) {
         if (!user) { res.status(401).json({ ok:false, reason:"no user" }); return; }
         res.json({ ok:true, user:summarizeUser(user) });
         return;
       }
-
       if (req.query.listonline == 1) {
         if (!user) { res.status(401).end("Unauthorized"); return; }
         res.json({ ok:true, agents:listOnline() });
         return;
       }
 
+      // Quick shell echo to verify path/channel
       if (req.query.echoshell == 1) {
         if (!user) { res.status(401).end("Unauthorized"); return; }
-        const raw = req.query.id;
-        if (!raw) { res.json({ ok:false, reason:"missing id"}); return; }
-        const id = normalizeId(Array.isArray(raw) ? raw[0] : raw);
-        const out = await sendShell(id, `cmd /c echo odc_ok || powershell -NoProfile -Command "Write-Host odc_ok"`);
-        res.json({ ok:true, id, output: String(out||"") });
+        const rawId = req.query.id;
+        if (!rawId) { res.json({ ok:false, reason:"missing id"}); return; }
+        const id = normalizeId(Array.isArray(rawId) ? rawId[0] : rawId);
+        const out = await sendShell(id, `cmd /c echo odc_ok`);
+        res.json({ ok:true, id, output: (out && out.ok ? out.data : ""), meta: out });
         return;
       }
 
+      // Manual probe endpoint (shows raw output so you can compare with interactive tests)
+      if (req.query.cmdprobe == 1) {
+        if (!user) { res.status(401).end("Unauthorized"); return; }
+        const rawId = req.query.id;
+        if (!rawId) { res.json({ ok:false, reason:"missing id"}); return; }
+        const id = normalizeId(Array.isArray(rawId) ? rawId[0] : rawId);
+        if (!isAgentOnline(id)) { res.json({ ok:false, reason:"agent_offline", id }); return; }
+        const r = await sendShell(id, `cmd /c ${NETSTAT_PROBE}`);
+        res.json({ ok: !!(r && r.ok), id, raw: r && r.data || "", meta: r && (r.ok ? "ok" : r.reason) });
+        return;
+      }
+
+      // Status (presence only) or Status+shell (CMD probe)
       if (req.query.status == 1) {
         if (!user) { res.status(401).end("Unauthorized"); return; }
 
@@ -215,15 +159,9 @@ module.exports.onedrivecheck = function (parent) {
         const out = {};
         for (const id of ids) {
           try {
-            if (!isAgentOnline(id)) {
-              out[id] = { status:"Offline", port20707:false, port20773:false };
-              continue;
-            }
-            if (useShell) {
-              out[id] = await liveCheckWindows(id);
-            } else {
-              out[id] = { status:"Online (agent)", port20707:null, port20773:null };
-            }
+            if (!isAgentOnline(id)) { out[id] = { status:"Offline", port20707:false, port20773:false }; continue; }
+            if (useShell) out[id] = await probePortsCMD(id);
+            else out[id] = { status:"Online (agent)", port20707:null, port20773:null };
           } catch (e) {
             err(e);
             out[id] = { status:"Error", port20707:false, port20773:false, error:true };
@@ -237,6 +175,6 @@ module.exports.onedrivecheck = function (parent) {
     } catch (e) { err(e); res.sendStatus(500); }
   };
 
-  log("onedrivecheck SAFE baseline loaded");
+  log("onedrivecheck (CMD probe) loaded");
   return obj;
 };
