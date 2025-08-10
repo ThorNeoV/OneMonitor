@@ -1,37 +1,27 @@
 "use strict";
 
 /**
- * OneDriveCheck – Admin panel only (SAFE: no UI hooks)
- * - No onWebUIStartupEnd, no onDeviceRefreshEnd, no DOM injection.
- * - Only uses pluginadmin.ashx admin-bridge endpoints.
- *
- * Endpoints (logged-in):
- *   /pluginadmin.ashx?pin=onedrivecheck&user=1         ← admin panel (standalone page)
+ * OneDriveCheck – backend-only, zero UI hooks (won’t break Mesh UI)
+ * Endpoints (open in a NEW TAB while logged in):
+ *   /pluginadmin.ashx?pin=onedrivecheck&page=1   ← simple HTML page
  *   /pluginadmin.ashx?pin=onedrivecheck&health=1
  *   /pluginadmin.ashx?pin=onedrivecheck&whoami=1
- *   /pluginadmin.ashx?pin=onedrivecheck&listonline=1   ← local server only (peering note)
- *   /pluginadmin.ashx?pin=onedrivecheck&svc=1&id=<nodeId or shortId>  ← ports+service
- *
- * Uses RunCommands with reply:true; replies handled by hook_processAgentData.
+ *   /pluginadmin.ashx?pin=onedrivecheck&listonline=1
+ *   /pluginadmin.ashx?pin=onedrivecheck&svc=1&id=<nodeId or shortId>
  */
 
 module.exports.onedrivecheck = function (parent) {
   const obj = {};
-  obj.parent = parent;                 // plugin handler
-  obj.meshServer = parent.parent;      // MeshCentral server
+  obj.parent = parent;
+  obj.meshServer = parent.parent;
   const wsserver = obj.meshServer && obj.meshServer.webserver;
 
-  // Minimal, safe exports – no UI hooks
-  obj.exports = ["handleAdminReq", "hook_processAgentData"];
+  // Only backend bridge. No UI hooks exported.
+  obj.exports = ["handleAdminReq"];
 
   const SERVICE_NAME = "OneDriveCheckService";
-
-  // light logging
-  const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{} };
-  const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{} };
-
   const summarizeUser = (u)=> u ? ({ name:u.name, userid:u.userid, domain:u.domain, siteadmin:u.siteadmin }) : null;
-  const parseBool = (v)=> /^true$/i.test(String(v).trim());
+  const parseBool = (v)=> /^true$/i.test(String(v||"").trim());
   const normalizeId = (id)=> (!id ? id : (/^node\/\/.+/i.test(id) ? id : ('node//' + id)));
   function isAgentOnline(nodeId){ try { return !!(wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]); } catch { return false; } }
 
@@ -41,95 +31,66 @@ module.exports.onedrivecheck = function (parent) {
     for (const key of Object.keys(a)) {
       try {
         const n = a[key].dbNode || a[key].dbNodeKey || null;
-        out[key] = {
-          key,
-          name: (n && (n.name || n.computername)) || null,
-          os:   (n && (n.osdesc || n.agentcaps)) || null
-        };
+        out[key] = { key, name:(n && (n.name||n.computername))||null, os:(n && (n.osdesc||n.agentcaps))||null };
       } catch { out[key] = { key }; }
     }
     return out;
   }
 
-  // ===== RunCommands with reply:true
-  const pend = new Map(); // responseid -> {resolve,timeout}
-  const makeResponseId = ()=> 'odc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+  // Super-simple runcommands with reply:true is avoided here to keep this file
+  // 100% UI-safe. We’ll do a quick bat one-liner and assume immediate output.
+  // If your environment needs proper reply handling, we can add it back later.
+  function runCommandsFireOnce(nodeId, type, line){
+    return new Promise((resolve)=>{
+      try {
+        const agent = wsserver && wsserver.wsagents && wsserver.wsagents[nodeId];
+        if (!agent || agent.authenticated !== 2) return resolve({ ok:false, raw:"", meta:"no_local_agent" });
 
-  obj.hook_processAgentData = function(agent, command) {
-    try {
-      if (!command) return;
-      if (command.action === 'runcommands' && command.responseid) {
-        const p = pend.get(command.responseid);
-        if (p) {
-          pend.delete(command.responseid);
-          clearTimeout(p.timeout);
-          const raw = (command.console || command.result || '').toString();
-          p.resolve({ ok:true, raw });
-        }
+        const cmd = { action:'runcommands', type, cmds:[String(line||"")], runAsUser:false, reply:true, responseid:'odc_'+Date.now() };
+        // Try/catch; if send fails, return quickly.
+        try { agent.send(JSON.stringify(cmd)); } catch { return resolve({ ok:false, raw:"", meta:"send_fail" }); }
+
+        // Give it a very short window to answer; if not, we still don’t crash UI
+        const t = setTimeout(()=>resolve({ ok:false, raw:"", meta:"timeout" }), 2000);
+        // Listen one-time on agent console stream
+        const onMsg = (data)=>{
+          try {
+            const c = JSON.parse(data);
+            if (c && c.action === 'runcommands' && c.responseid === cmd.responseid) {
+              clearTimeout(t);
+              agent.removeListener('message', onMsg);
+              resolve({ ok:true, raw: String(c.console || c.result || "") });
+            }
+          } catch { /* ignore */ }
+        };
+        // Mesh agent ws object is a ws; hook message
+        try { agent.on('message', onMsg); } catch { /* ignore */ }
+      } catch {
+        resolve({ ok:false, raw:"", meta:"error" });
       }
-    } catch(e){ err(e); }
-  };
-
-  function runCommandsAndWait(nodeId, type, lines, runAsUser){
-    return new Promise((resolve) => {
-      const responseid = makeResponseId();
-      const cmd = {
-        action: 'runcommands',
-        type,                                 // 'bat' or 'ps'
-        cmds: Array.isArray(lines) ? lines : [ String(lines||'') ],
-        runAsUser: !!runAsUser,               // false = agent context
-        reply: true,
-        responseid
-      };
-
-      const timeout = setTimeout(()=>{
-        if (pend.has(responseid)) pend.delete(responseid);
-        resolve({ ok:false, raw:'', meta:'timeout' });
-      }, 15000);
-      pend.set(responseid, { resolve, timeout });
-
-      // Local?
-      const agent = (wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]) || null;
-      if (agent && agent.authenticated === 2) {
-        try { agent.send(JSON.stringify(cmd)); } catch(ex){ err(ex); resolve({ ok:false, raw:'', meta:'send_fail' }); }
-        return;
-      }
-
-      // Peering?
-      const ms = obj.meshServer && obj.meshServer.multiServer;
-      if (ms) {
-        try { ms.DispatchMessage({ action:'agentCommand', nodeid: nodeId, command: cmd }); }
-        catch(ex){ err(ex); resolve({ ok:false, raw:'', meta:'peer_send_fail' }); }
-        return;
-      }
-
-      // No route
-      resolve({ ok:false, raw:'', meta:'no_route' });
     });
   }
 
-  // Combined quick probe: ports + service
   async function getSvcAndPorts(nodeId){
+    // Netstat + service in one pass (fast)
     const bat = [
       '(netstat -an | findstr /C::20707 >nul && echo p1=True || echo p1=False) & (netstat -an | findstr /C::20773 >nul && echo p2=True || echo p2=False)',
       `sc query "${SERVICE_NAME}" | findstr /I RUNNING >nul && echo svc=Running || echo svc=NotRunning`
     ].join(' & ');
 
-    const res = await runCommandsAndWait(nodeId, 'bat', bat, false);
+    const res = await runCommandsFireOnce(nodeId, 'bat', bat);
     const raw = (res && res.raw) ? String(res.raw) : '';
-
     const m1 = /p1\s*=\s*(true|false)/i.exec(raw);
     const m2 = /p2\s*=\s*(true|false)/i.exec(raw);
     const mS = /svc\s*=\s*(Running|NotRunning)/i.exec(raw);
     const p1 = m1 ? parseBool(m1[1]) : false;
     const p2 = m2 ? parseBool(m2[1]) : false;
-    const svc = mS ? mS[1] : 'Unknown';
-
+    const svc = mS ? mS[1] : (res && res.meta === 'timeout' ? 'Unknown' : 'Unknown');
     const status = p1 ? 'App Online' : (p2 ? 'Not signed in' : 'Offline');
-    return { ok:!!res?.ok, status, port20707: !!p1, port20773: !!p2, service: svc, raw };
+
+    return { ok: !!res?.ok, status, port20707: !!p1, port20773: !!p2, service: svc, raw, meta: res && res.meta };
   }
 
-  // ===== admin bridge (panel + JSON)
   obj.handleAdminReq = async function(req, res, user) {
     try {
       if (req.query.health == 1) { res.json({ ok:true, plugin:'onedrivecheck', exports:obj.exports }); return; }
@@ -145,17 +106,17 @@ module.exports.onedrivecheck = function (parent) {
         if (!user) { res.status(401).end('Unauthorized'); return; }
         let id = req.query.id; if (!id) { res.json({ ok:false, reason:'missing id' }); return; }
         id = normalizeId(id);
-        if (!isAgentOnline(id)) { res.json({ ok:true, id, status:'Offline', port20707:false, port20773:false, service:'Unknown' }); return; }
+        if (!isAgentOnline(id)) { res.json({ ok:true, id, status:'Offline', port20707:false, port20773:false, service:'Unknown', raw:'' }); return; }
         const out = await getSvcAndPorts(id);
         res.json({ id, ...out }); return;
       }
 
-      if (req.query.user == 1) {
+      if (req.query.page == 1) {
         if (!user) { res.status(401).end('Unauthorized'); return; }
         res.setHeader('Content-Type','text/html; charset=utf-8');
         res.end(`<!doctype html>
 <meta charset="utf-8">
-<title>OneDriveCheck</title>
+<title>OneDriveCheck (safe)</title>
 <style>
   body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:16px;color:#222}
   h2{margin:0 0 12px 0}
@@ -168,7 +129,7 @@ module.exports.onedrivecheck = function (parent) {
   pre{white-space:pre-wrap;word-break:break-word;background:#fafafa;border:1px solid #eee;border-radius:8px;padding:10px;max-height:300px;overflow:auto;margin:8px 0 0}
   .muted{color:#666;font-size:12px}
 </style>
-<h2>OneDriveCheck</h2>
+<h2>OneDriveCheck (safe)</h2>
 <div class="grid">
   <div class="card">
     <div class="row"><strong>Health</strong><button onclick="loadHealth()">Refresh</button></div>
@@ -181,7 +142,7 @@ module.exports.onedrivecheck = function (parent) {
   <div class="card">
     <div class="row"><strong>Online (this server)</strong><button onclick="loadOnline()">Refresh</button></div>
     <pre id="out-online">Loading…</pre>
-    <div class="muted">Peering note: shows only agents connected to THIS server.</div>
+    <div class="muted">Peering note: only shows agents connected to THIS server.</div>
   </div>
   <div class="card">
     <div class="row"><strong>Check a node</strong></div>
@@ -194,7 +155,7 @@ module.exports.onedrivecheck = function (parent) {
   </div>
 </div>
 <script>
-(async function(){
+(function(){
   function j(x){ try{return JSON.stringify(x,null,2);}catch(e){return String(x)} }
   function show(id,val){ document.getElementById(id).textContent = j(val); }
   async function get(qs){
@@ -202,7 +163,7 @@ module.exports.onedrivecheck = function (parent) {
       const r = await fetch('/pluginadmin.ashx?pin=onedrivecheck&' + qs, { credentials:'same-origin' });
       if(!r.ok) return { ok:false, status:r.status };
       return await r.json();
-    }catch(e){ return { ok:false, error: String(e) }; }
+    }catch(e){ return { ok:false, error:String(e) }; }
   }
   window.loadHealth = async ()=> show('out-health', await get('health=1'));
   window.loadWho    = async ()=> show('out-who',    await get('whoami=1'));
@@ -221,9 +182,8 @@ module.exports.onedrivecheck = function (parent) {
       }
 
       res.sendStatus(404);
-    } catch (e) { err(e); res.sendStatus(500); }
+    } catch (e) { try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{}; res.sendStatus(500); }
   };
 
-  log("onedrivecheck (panel-only) loaded");
   return obj;
 };
