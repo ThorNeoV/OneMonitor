@@ -4,7 +4,7 @@
   "version": "0.4.6",
   "author": "you",
   "description": "Fast status check using agent-side CMD + netstat via admin bridge.",
-  "hasAdminPanel": false,
+  "hasAdminPanel": true,
   "homepage": "https://github.com/ThorNeoV/OneMonitor",
   "changelogUrl": "https://raw.githubusercontent.com/ThorNeoV/OneMonitor/refs/heads/main/README.md",
   "configUrl": "https://raw.githubusercontent.com/ThorNeoV/OneMonitor/refs/heads/main/config.json",
@@ -15,6 +15,7 @@
   },
   "meshCentralCompat": ">=1.0.0"
 }
+
 
 
 
