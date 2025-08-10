@@ -1,194 +1,155 @@
 "use strict";
 
 /**
- * OneDriveCheck – UI-safe baseline (NO injection)
- * Endpoints (while logged in):
- *  - /pluginadmin.ashx?pin=onedrivecheck&health=1
- *  - /pluginadmin.ashx?pin=onedrivecheck&whoami=1
- *  - /pluginadmin.ashx?pin=onedrivecheck&listonline=1
- *  - /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<shortOrLongId>[&id=...]
- *     -> fast CMD netstat; fallback sc query "OneDriveCheckService"
+ * OneDriveCheck – tiny admin dashboard (SAFE: admin-bridge only)
+ *
+ * URLs (while logged in):
+ *   /pluginadmin.ashx?pin=onedrivecheck&admin=1      → dashboard page
+ *   /pluginadmin.ashx?pin=onedrivecheck&health=1
+ *   /pluginadmin.ashx?pin=onedrivecheck&whoami=1
+ *   /pluginadmin.ashx?pin=onedrivecheck&listonline=1
  */
 
 module.exports.onedrivecheck = function (parent) {
   const obj = {};
-  obj.parent = parent;
-  obj.meshServer = parent.parent;
-  const wsserver = obj.meshServer.webserver;
+  obj.parent = parent;                 // plugin handler
+  obj.meshServer = parent.parent;      // MeshCentral server
+  const wsserver = obj.meshServer && obj.meshServer.webserver;
 
-  // Only this hook -> cannot affect UI rendering
-  obj.exports = ["handleAdminReq", "hook_processAgentData"];
+  // Only expose the admin bridge handler
+  obj.exports = ["handleAdminReq"];
 
-  const SERVICE_NAME = "OneDriveCheckService";
-  const CACHE_TTL_MS = 15000;
-
+  // Log helpers
   const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{ console.log("onedrivecheck:", m); } };
   const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{ console.error("onedrivecheck error:", e); } };
 
+  // Summaries
   const summarizeUser = (u)=> u ? ({ name:u.name, userid:u.userid, domain:u.domain, siteadmin:u.siteadmin }) : null;
-  const parseBool = (v)=> /^true$/i.test(String(v||"").trim());
-  const normalizeId = (id)=> (!id ? id : (/^node\/\/.+/i.test(id) ? id : ("node//" + id)));
-  const isAgentOnline = (nodeId)=> !!(wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]);
 
-  const listOnline = ()=>{
+  // Local-online list (note: in peering this only shows agents on THIS node)
+  function listOnline() {
     const a = (wsserver && wsserver.wsagents) || {};
     const out = {};
-    for (const k of Object.keys(a)) {
+    for (const key of Object.keys(a)) {
       try {
-        const n = a[k].dbNode || a[k].dbNodeKey || null;
-        out[k] = { key:k, name:(n && (n.name||n.computername))||null, os:(n && (n.osdesc||n.agentcaps))||null };
-      } catch { out[k] = { key:k }; }
+        const n = a[key].dbNode || a[key].dbNodeKey || null;
+        out[key] = {
+          key,
+          name: (n && (n.name || n.computername)) || null,
+          os:   (n && (n.osdesc || n.agentcaps)) || null
+        };
+      } catch { out[key] = { key }; }
     }
     return out;
-  };
-
-  // runcommands with reply:true (peering-safe)
-  const pend = new Map();
-  const makeResponseId = ()=> 'odc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-
-  obj.hook_processAgentData = function(agent, command) {
-    try {
-      if (!command) return;
-      if (command.action === 'runcommands' && command.responseid) {
-        const p = pend.get(command.responseid);
-        if (p) {
-          pend.delete(command.responseid);
-          clearTimeout(p.timeout);
-          const raw = (command.console || command.result || '').toString();
-          p.resolve({ ok:true, raw });
-        }
-      }
-    } catch (e) { err(e); }
-  };
-
-  function runCommandsAndWait(nodeId, type, lines, runAsUser){
-    return new Promise((resolve) => {
-      const responseid = makeResponseId();
-      const theCommand = {
-        action: 'runcommands',
-        type, // 'bat' or 'ps'
-        cmds: Array.isArray(lines) ? lines : [ String(lines||'') ],
-        runAsUser: !!runAsUser, // false = agent service
-        reply: true,
-        responseid
-      };
-
-      const timeout = setTimeout(() => {
-        if (pend.has(responseid)) { pend.delete(responseid); }
-        resolve({ ok:false, raw:'', meta:'timeout' });
-      }, 15000);
-      pend.set(responseid, { resolve, timeout });
-
-      const agent = (wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]) || null;
-      if (agent && agent.authenticated === 2) {
-        try { agent.send(JSON.stringify(theCommand)); } catch (ex) { err(ex); resolve({ ok:false, raw:'', meta:'send_fail' }); }
-        return;
-      }
-      const ms = obj.meshServer && obj.meshServer.multiServer;
-      if (ms) {
-        try { ms.DispatchMessage({ action:'agentCommand', nodeid: nodeId, command: theCommand }); }
-        catch (ex) { err(ex); resolve({ ok:false, raw:'', meta:'peer_send_fail' }); }
-        return;
-      }
-      resolve({ ok:false, raw:'', meta:'no_route' });
-    });
   }
 
-  const cache = new Map(); // nodeId -> { t, result }
-
-  async function probeNode(nodeId){
-    const now = Date.now();
-    const c = cache.get(nodeId);
-    if (c && (now - c.t) < CACHE_TTL_MS) return c.result;
-
-    // 1) fast netstat (CMD)
-    const netstatLine =
-      '(netstat -an | findstr /C::20707 >nul && echo p1=True || echo p1=False) & ' +
-      '(netstat -an | findstr /C::20773 >nul && echo p2=True || echo p2=False)';
-    const r1 = await runCommandsAndWait(nodeId, 'bat', netstatLine, false);
-    const raw1 = (r1 && r1.raw) ? String(r1.raw) : '';
-    const m1 = /p1\s*=\s*(true|false)/i.exec(raw1);
-    const m2 = /p2\s*=\s*(true|false)/i.exec(raw1);
-    const p1 = m1 ? parseBool(m1[1]) : false;
-    const p2 = m2 ? parseBool(m2[1]) : false;
-
-    let result;
-    if (!r1 || r1.ok !== true) {
-      result = { status:'Unknown', port20707:false, port20773:false };
-    } else if (p1) {
-      result = { status:'Running', port20707:true,  port20773:p2 };
-    } else if (p2) {
-      result = { status:'Running (No Sign-In)', port20707:false, port20773:true };
-    } else {
-      // 2) service state via sc
-      const scLine = `sc query "${SERVICE_NAME}" | findstr /I RUNNING >nul && echo svc=Running || echo svc=Stopped`;
-      const r2 = await runCommandsAndWait(nodeId, 'bat', scLine, false);
-      const raw2 = (r2 && r2.raw) ? String(r2.raw) : '';
-      const ms = /svc\s*=\s*(Running|Stopped)/i.exec(raw2);
-      if (r2 && r2.ok === true && ms) {
-        const svcRunning = /Running/i.test(ms[1]);
-        result = { status: (svcRunning ? 'Running' : 'Stopped'), port20707:false, port20773:false };
-      } else {
-        result = { status:'Unknown', port20707:false, port20773:false };
-      }
-    }
-
-    cache.set(nodeId, { t: now, result });
-    return result;
-  }
-
-  obj.handleAdminReq = async function(req, res, user) {
+  // Admin bridge
+  obj.handleAdminReq = function (req, res, user) {
     try {
-      // simple health
+      // Basic JSON endpoints
       if (req.query.health == 1) {
-        res.json({ ok:true, plugin:"onedrivecheck", exports: obj.exports });
+        res.json({ ok:true, plugin:"onedrivecheck", exports:obj.exports });
         return;
       }
 
       if (req.query.whoami == 1) {
-        if (!user) { res.status(401).json({ ok:false, reason:'no user' }); return; }
-        res.json({ ok:true, user:summarizeUser(user) });
+        if (!user) { res.status(401).json({ ok:false, reason:"no user" }); return; }
+        res.json({ ok:true, user: summarizeUser(user) });
         return;
       }
 
       if (req.query.listonline == 1) {
-        if (!user) { res.status(401).end('Unauthorized'); return; }
-        res.json({ ok:true, agents:listOnline() });
+        if (!user) { res.status(401).end("Unauthorized"); return; }
+        res.json({ ok:true, agents: listOnline() });
         return;
       }
 
-      if (req.query.status == 1) {
-        if (!user) { res.status(401).end('Unauthorized'); return; }
-        let ids = req.query.id; if (!ids) { res.json({}); return; }
-        if (!Array.isArray(ids)) ids = [ids];
-        ids = ids.map(normalizeId);
+      // Simple admin dashboard page
+      if (req.query.admin == 1) {
+        if (!user) { res.status(401).end("Unauthorized"); return; }
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
+        res.end(`<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>OneDriveCheck – Admin</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin:20px; color:#222;}
+  h2{margin:0 0 14px 0}
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px;}
+  .card{border:1px solid #ddd; border-radius:10px; padding:14px; box-shadow:0 1px 2px rgba(0,0,0,0.04);}
+  .row{display:flex; align-items:center; gap:8px; margin:0 0 8px 0}
+  button{padding:6px 10px; border-radius:8px; border:1px solid #bbb; background:#f8f8f8; cursor:pointer}
+  button:hover{background:#f0f0f0}
+  pre{white-space:pre-wrap; word-break:break-word; background:#fafafa; border:1px solid #eee; border-radius:8px; padding:10px; max-height:320px; overflow:auto; margin:8px 0 0 0}
+  code{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;}
+  .muted{color:#666; font-size:12px}
+</style>
+</head>
+<body>
+  <h2>OneDriveCheck – Admin</h2>
+  <div class="muted">This page shows the raw JSON of the three endpoints. Use the refresh buttons to re-run.</div>
+  <div class="grid" style="margin-top:12px">
+    <div class="card">
+      <div class="row">
+        <strong>Health</strong>
+        <button onclick="loadHealth()">Refresh</button>
+      </div>
+      <pre id="out-health">Loading…</pre>
+      <div class="muted"><code>?pin=onedrivecheck&amp;health=1</code></div>
+    </div>
 
-        const out = {};
-        const queue = ids.slice();
-        const MAX_PAR = 6;
-        async function worker(){
-          while(queue.length){
-            const id = queue.shift();
-            try {
-              if (!isAgentOnline(id)) { out[id] = { status:'Offline', port20707:false, port20773:false }; continue; }
-              out[id] = await probeNode(id);
-            } catch (e) { err(e); out[id] = { status:'Unknown', port20707:false, port20773:false }; }
-          }
-        }
-        await Promise.all(Array.from({length: Math.min(MAX_PAR, ids.length)}, worker));
-        res.json(out);
+    <div class="card">
+      <div class="row">
+        <strong>Who am I</strong>
+        <button onclick="loadWho()">Refresh</button>
+      </div>
+      <pre id="out-who">Loading…</pre>
+      <div class="muted"><code>?pin=onedrivecheck&amp;whoami=1</code></div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <strong>List Online (local server)</strong>
+        <button onclick="loadOnline()">Refresh</button>
+      </div>
+      <pre id="out-online">Loading…</pre>
+      <div class="muted"><code>?pin=onedrivecheck&amp;listonline=1</code><br>Note: in peering, this only shows agents connected to this server.</div>
+    </div>
+  </div>
+
+<script>
+(function(){
+  function j(x){ try{return JSON.stringify(x,null,2);}catch(e){return String(x);} }
+  function show(id, data){ document.getElementById(id).textContent = j(data); }
+
+  async function get(qs){
+    const u = '/pluginadmin.ashx?pin=onedrivecheck&' + qs;
+    try{
+      const r = await fetch(u, { credentials:'same-origin' });
+      if (!r.ok) return { ok:false, status:r.status };
+      return await r.json();
+    }catch(e){ return { ok:false, error:String(e) }; }
+  }
+
+  window.loadHealth = async function(){ show('out-health', await get('health=1')); };
+  window.loadWho    = async function(){ show('out-who',    await get('whoami=1')); };
+  window.loadOnline = async function(){ show('out-online', await get('listonline=1')); };
+
+  // initial load
+  loadHealth(); loadWho(); loadOnline();
+})();
+</script>
+</body>
+</html>`);
         return;
       }
 
-      if (req.query.debug == 1) {
-        res.json({ ok:true, user:summarizeUser(user)||null, hasWsAgents: !!(wsserver && wsserver.wsagents) });
-        return;
-      }
-
+      // nothing matched
       res.sendStatus(404);
     } catch (e) { err(e); res.sendStatus(500); }
   };
 
-  log("onedrivecheck baseline loaded (no UI injection).");
+  log("onedrivecheck admin dashboard loaded");
   return obj;
 };
