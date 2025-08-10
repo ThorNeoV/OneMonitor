@@ -20,11 +20,15 @@ module.exports.onedrivecheck = function (parent) {
   obj.exports = ["handleAdminReq"];
 
   // --- logging
-  const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{ console.log("onedrivecheck:", m); } };
-  const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{ console.error("onedrivecheck error:", e); } };
+  const log = (m) => { try { obj.meshServer.info("onedrivecheck: " + m); } catch { console.log("onedrivecheck:", m); } };
+  const err = (e) => { try { obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); } catch { console.error("onedrivecheck error:", e); } };
 
   // --- helpers
-  const summarizeUser = (u)=> u ? ({ name:u.name, userid:u.userid, domain:u.domain, siteadmin:u.siteadmin }) : null;
+  const summarizeUser = (u) => u ? ({ name: u.name, userid: u.userid, domain: u.domain, siteadmin: u.siteadmin }) : null;
+
+  function parseBool(v) {
+    return /^true$/i.test(String(v).trim());
+  }
 
   function normalizeId(id) {
     if (!id) return id;
@@ -32,7 +36,7 @@ module.exports.onedrivecheck = function (parent) {
     return 'node//' + id;                       // convert short UI id
   }
 
-  function isAgentOnline(nodeId){
+  function isAgentOnline(nodeId) {
     try {
       const a = obj.meshServer && obj.meshServer.webserver && obj.meshServer.webserver.wsagents;
       return !!(a && a[nodeId]);
@@ -81,46 +85,51 @@ module.exports.onedrivecheck = function (parent) {
       }
     });
   }
-  
+
   async function liveCheckWindows(nodeId) {
-    // Run PowerShell through CMD
-    const psCmd = 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$p1=(Test-NetConnection -ComputerName localhost -Port 20707 -WarningAction SilentlyContinue).TcpTestSucceeded; $p2=(Test-NetConnection -ComputerName localhost -Port 20773 -WarningAction SilentlyContinue).TcpTestSucceeded; Write-Output (\\\"p1=\\\" + $p1 + \\\";p2=\\\" + $p2)"';
-    
+    const psCmd =
+      'powershell -NoProfile -ExecutionPolicy Bypass -Command ' +
+      '"$p1=(Test-NetConnection -ComputerName localhost -Port 20707 -WarningAction SilentlyContinue).TcpTestSucceeded; ' +
+      '$p2=(Test-NetConnection -ComputerName localhost -Port 20773 -WarningAction SilentlyContinue).TcpTestSucceeded; ' +
+      'Write-Output (\'p1=\' + $p1 + \';p2=\' + $p2)"';
+
     const out = await sendShell(nodeId, `cmd /c ${psCmd}`);
+    log(`Shell output for ${nodeId}: ${out}`);
+
     const m = /p1\s*=\s*(true|false).*?p2\s*=\s*(true|false)/i.exec(out || "");
     const p1 = m ? parseBool(m[1]) : false;
     const p2 = m ? parseBool(m[2]) : false;
     const status = p1 ? "App Online" : (p2 ? "Not signed in" : "Offline");
-    return { status, port20707: !!p1, port20773: !!p2, raw: out.trim() };
+    return { status, port20707: !!p1, port20773: !!p2, raw: out ? out.trim() : "" };
   }
 
   // --- admin bridge only
-  obj.handleAdminReq = async function(req, res, user) {
+  obj.handleAdminReq = async function (req, res, user) {
     try {
       if (req.query.debug == 1) {
-        res.json({ ok:true, via:"handleAdminReq", hasUser:!!user, user:summarizeUser(user), hasSession:!!(req && req.session) });
+        res.json({ ok: true, via: "handleAdminReq", hasUser: !!user, user: summarizeUser(user), hasSession: !!(req && req.session) });
         return;
       }
 
       if (req.query.whoami == 1) {
-        if (!user) { res.status(401).json({ ok:false, reason:"no user" }); return; }
-        res.json({ ok:true, user:summarizeUser(user) });
+        if (!user) { res.status(401).json({ ok: false, reason: "no user" }); return; }
+        res.json({ ok: true, user: summarizeUser(user) });
         return;
       }
 
       if (req.query.listonline == 1) {
         if (!user) { res.status(401).end("Unauthorized"); return; }
-        res.json({ ok:true, agents:listOnline() });
+        res.json({ ok: true, agents: listOnline() });
         return;
       }
 
       if (req.query.echoshell == 1) {
         if (!user) { res.status(401).end("Unauthorized"); return; }
         const raw = req.query.id;
-        if (!raw) { res.json({ ok:false, reason:"missing id"}); return; }
+        if (!raw) { res.json({ ok: false, reason: "missing id" }); return; }
         const id = normalizeId(Array.isArray(raw) ? raw[0] : raw);
         const out = await sendShell(id, `cmd /c echo odc_ok || powershell -NoProfile -Command "Write-Host odc_ok"`);
-        res.json({ ok:true, id, output: String(out||"") });
+        res.json({ ok: true, id, output: String(out || "") });
         return;
       }
 
@@ -132,23 +141,23 @@ module.exports.onedrivecheck = function (parent) {
         if (!Array.isArray(ids)) ids = [ids];
 
         ids = ids.map(normalizeId);
-        const useShell = String(req.query.shell||"") === "1";
+        const useShell = String(req.query.shell || "") === "1";
 
         const out = {};
         for (const id of ids) {
           try {
             if (!isAgentOnline(id)) {
-              out[id] = { status:"Offline", port20707:false, port20773:false };
+              out[id] = { status: "Offline", port20707: false, port20773: false };
               continue;
             }
             if (useShell) {
-              out[id] = await probePortsWindows(id);
+              out[id] = await liveCheckWindows(id);
             } else {
-              out[id] = { status:"Online (agent)", port20707:null, port20773:null };
+              out[id] = { status: "Online (agent)", port20707: null, port20773: null };
             }
           } catch (e) {
             err(e);
-            out[id] = { status:"Error", port20707:false, port20773:false, error:true };
+            out[id] = { status: "Error", port20707: false, port20773: false, error: true };
           }
         }
         res.json(out);
@@ -162,4 +171,3 @@ module.exports.onedrivecheck = function (parent) {
   log("onedrivecheck SAFE baseline loaded");
   return obj;
 };
-
