@@ -55,39 +55,43 @@ module.exports.onedrivecheck = function (parent) {
     return out;
   }
 
-  function sendShell(nodeId, cmd){
-    return new Promise((resolve)=>{
-      if (!obj.meshServer || typeof obj.meshServer.sendCommand !== "function") { resolve(""); return; }
-      const payload = { cmd, type: "powershell" };
+  function sendShell(nodeId, cmd) {
+    return new Promise((resolve) => {
+      if (!obj.meshServer || typeof obj.meshServer.sendCommand !== "function") {
+        resolve("");
+        return;
+      }
+      const payload = { cmd, type: "cmd" }; // Force CMD channel
       let done = false;
-      const timer = setTimeout(()=>{ if(!done){ done=true; resolve(""); } }, 7000);
+      const timer = setTimeout(() => {
+        if (!done) { done = true; resolve(""); }
+      }, 7000);
       try {
-        obj.meshServer.sendCommand(nodeId, "shell", payload, function (resp){
-          if (done) return; done = true; clearTimeout(timer);
+        obj.meshServer.sendCommand(nodeId, "shell", payload, function (resp) {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
           resolve(resp && resp.data ? String(resp.data) : "");
         });
-      } catch(e){
-        if (done) return; done = true; clearTimeout(timer);
+      } catch (e) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
         resolve("");
       }
     });
   }
-
-  const parseBool = (s)=> /true/i.test(String(s||""));
-
-  async function probePortsWindows(nodeId){
-    // Probe 20707 & 20773 via agent PowerShell (Windows)
-    const ps = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ' +
-      "\"$p1=(Test-NetConnection -ComputerName localhost -Port 20707 -WarningAction SilentlyContinue).TcpTestSucceeded; " +
-      "$p2=(Test-NetConnection -ComputerName localhost -Port 20773 -WarningAction SilentlyContinue).TcpTestSucceeded; " +
-      "Write-Output ('p1=' + $p1 + ';p2=' + $p2)\"";
-
-    const out = await sendShell(nodeId, ps);
-    const m = /p1\s*=\s*(true|false).*?p2\s*=\s*(true|false)/i.exec(out||"");
+  
+  async function liveCheckWindows(nodeId) {
+    // Run PowerShell through CMD
+    const psCmd = 'powershell -NoProfile -ExecutionPolicy Bypass -Command "$p1=(Test-NetConnection -ComputerName localhost -Port 20707 -WarningAction SilentlyContinue).TcpTestSucceeded; $p2=(Test-NetConnection -ComputerName localhost -Port 20773 -WarningAction SilentlyContinue).TcpTestSucceeded; Write-Output (\\\"p1=\\\" + $p1 + \\\";p2=\\\" + $p2)"';
+    
+    const out = await sendShell(nodeId, `cmd /c ${psCmd}`);
+    const m = /p1\s*=\s*(true|false).*?p2\s*=\s*(true|false)/i.exec(out || "");
     const p1 = m ? parseBool(m[1]) : false;
     const p2 = m ? parseBool(m[2]) : false;
     const status = p1 ? "App Online" : (p2 ? "Not signed in" : "Offline");
-    return { status, port20707: !!p1, port20773: !!p2, raw: out };
+    return { status, port20707: !!p1, port20773: !!p2, raw: out.trim() };
   }
 
   // --- admin bridge only
@@ -158,3 +162,4 @@ module.exports.onedrivecheck = function (parent) {
   log("onedrivecheck SAFE baseline loaded");
   return obj;
 };
+
