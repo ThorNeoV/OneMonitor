@@ -1,30 +1,34 @@
 "use strict";
 
 /**
- * OneDriveCheck (server) – peering-safe runcommands with reply
- * - Adds /pluginadmin.ashx?pin=onedrivecheck endpoints:
- *    • &debug=1
- *    • &whoami=1
- *    • &listonline=1
- *    • &status=1&id=<shortOrLongId>[&id=...]      → probes via CMD+netstat (fast)
- *    • &include=1&path=ui.js                      → serves UI injector JS
- * - UI injector adds a column in device list + a pill on device page.
+ * OneDriveCheck – single-file, safe UI column + device pill
+ * - Admin bridge endpoints (while logged in):
+ *    • /pluginadmin.ashx?pin=onedrivecheck&debug=1
+ *    • /pluginadmin.ashx?pin=onedrivecheck&whoami=1
+ *    • /pluginadmin.ashx?pin=onedrivecheck&listonline=1
+ *    • /pluginadmin.ashx?pin=onedrivecheck&status=1&id=<shortOrLongId>[&id=...]   (returns Running/Stopped/Offline/Unknown)
+ *    • /pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js                   (UI injector)
  *
- * No risky Express hooks. Uses admin bridge only. Replies handled via hook_processAgentData.
+ * - UI adds a “OneDriveCheck” column on device list + a pill on device page.
+ * - Peering-safe runcommands with reply:true; replies handled in hook_processAgentData.
  */
 
 module.exports.onedrivecheck = function (parent) {
   const obj = {};
-  obj.parent = parent;                 // plugin handler
-  obj.meshServer = parent.parent;      // MeshCentral server
+  obj.parent = parent;
+  obj.meshServer = parent.parent;
   const wsserver = obj.meshServer.webserver;
 
-  // Some Mesh builds call only hooks listed here
+  // Mesh sometimes only calls hooks listed in exports:
   obj.exports = ["handleAdminReq", "hook_processAgentData", "onWebUIStartupEnd"];
 
   // ---- logging
   const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{ console.log("onedrivecheck:", m); } };
   const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{ console.error("onedrivecheck error:", e); } };
+
+  // ---- constants
+  const SERVICE_NAME = 'OneDriveCheckService';
+  const CACHE_TTL_MS = 15000; // per-node cache to avoid spamming runcommands
 
   // ---- helpers
   const summarizeUser = (u)=> u ? ({ name:u.name, userid:u.userid, domain:u.domain, siteadmin:u.siteadmin }) : null;
@@ -51,43 +55,34 @@ module.exports.onedrivecheck = function (parent) {
   const pend = new Map();
   function makeResponseId(){ return 'odc_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
 
-  // Handle agent replies globally
-  obj.hook_processAgentData = function(agent, command /* JSON from agent */) {
+  // Handle agent replies for runcommands
+  obj.hook_processAgentData = function(agent, command) {
     try {
       if (!command) return;
-
-      // Native runcommands reply path (when reply:true was set)
       if (command.action === 'runcommands' && command.responseid) {
         const p = pend.get(command.responseid);
         if (p) {
           pend.delete(command.responseid);
           clearTimeout(p.timeout);
-          // command.result may be 'OK' or include output. On newer builds output is in command.console or command.result.
           const raw = (command.console || command.result || '').toString();
           p.resolve({ ok:true, raw });
         }
-        return;
       }
-
-      // (Optional future) If we ever switch to plugin→agent consoleaction, handle here.
-      // if (command.action === 'plugin' && command.plugin === 'onedrivecheck' && command.pluginaction === 'status') { ... }
     } catch (e) { err(e); }
   };
 
-  // Send RunCommands to agent (local or peer), await reply
   function runCommandsAndWait(nodeId, type, lines, runAsUser){
     return new Promise((resolve) => {
       const responseid = makeResponseId();
       const theCommand = {
         action: 'runcommands',
-        type,                     // 'bat' or 'ps'
+        type,                               // 'bat' or 'ps'
         cmds: Array.isArray(lines) ? lines : [ String(lines||'') ],
-        runAsUser: !!runAsUser,   // false = run as agent
+        runAsUser: !!runAsUser,             // false => run as agent (service)
         reply: true,
         responseid
       };
 
-      // timeout safety
       const timeout = setTimeout(() => {
         if (pend.has(responseid)) { pend.delete(responseid); }
         resolve({ ok:false, raw:'', meta:'timeout' });
@@ -95,7 +90,7 @@ module.exports.onedrivecheck = function (parent) {
 
       pend.set(responseid, { resolve, timeout });
 
-      // Local?
+      // Local
       const agent = (wsserver && wsserver.wsagents && wsserver.wsagents[nodeId]) || null;
       if (agent && agent.authenticated === 2) {
         try { agent.send(JSON.stringify(theCommand)); }
@@ -103,7 +98,7 @@ module.exports.onedrivecheck = function (parent) {
         return;
       }
 
-      // Peering?
+      // Peers
       const ms = obj.meshServer && obj.meshServer.multiServer;
       if (ms) {
         try { ms.DispatchMessage({ action:'agentCommand', nodeid: nodeId, command: theCommand }); }
@@ -111,25 +106,58 @@ module.exports.onedrivecheck = function (parent) {
         return;
       }
 
-      // No route
       resolve({ ok:false, raw:'', meta:'no_route' });
     });
   }
 
-  // Fast Windows probe using CMD + netstat (no admin requirement)
-  async function probeWindowsFast(nodeId){
-    // Produces:
-    // p1=True
-    // p2=True
-    const line = '(netstat -an | findstr /C::20707 >nul && echo p1=True || echo p1=False) & (netstat -an | findstr /C::20773 >nul && echo p2=True || echo p2=False)';
-    const res = await runCommandsAndWait(nodeId, 'bat', line, false);
-    const raw = (res && res.raw) ? String(res.raw) : '';
-    const m1 = /p1\s*=\s*(true|false)/i.exec(raw);
-    const m2 = /p2\s*=\s*(true|false)/i.exec(raw);
+  // ---- cache: nodeId -> { t, result }
+  const cache = new Map();
+
+  // FAST check first: netstat for ports (very quick + non-admin).
+  // If that yields both closed, try SC query for service status to disambiguate.
+  async function probeNode(nodeId){
+    // cache
+    const now = Date.now();
+    const c = cache.get(nodeId);
+    if (c && (now - c.t) < CACHE_TTL_MS) return c.result;
+
+    // 1) quick ports via CMD
+    const netstatLine =
+      '(netstat -an | findstr /C::20707 >nul && echo p1=True || echo p1=False) & ' +
+      '(netstat -an | findstr /C::20773 >nul && echo p2=True || echo p2=False)';
+    const r1 = await runCommandsAndWait(nodeId, 'bat', netstatLine, false);
+    const raw1 = (r1 && r1.raw) ? String(r1.raw) : '';
+    const m1 = /p1\s*=\s*(true|false)/i.exec(raw1);
+    const m2 = /p2\s*=\s*(true|false)/i.exec(raw1);
     const p1 = m1 ? parseBool(m1[1]) : false;
     const p2 = m2 ? parseBool(m2[1]) : false;
-    const status = p1 ? 'App Online' : (p2 ? 'Not signed in' : 'Offline');
-    return { status, port20707: !!p1, port20773: !!p2, raw, meta: (res && res.meta) || undefined };
+
+    let result;
+    if (!r1 || r1.ok !== true) {
+      // Could not run commands (peering gap, perms, etc.)
+      result = { status:'Unknown', port20707:false, port20773:false };
+    } else if (p1) {
+      result = { status:'Running', port20707:true,  port20773:p2 };
+    } else if (p2) {
+      // OneDrive app “not signed in” state we used earlier maps to listening on 20773
+      result = { status:'Running (No Sign-In)', port20707:false, port20773:true };
+    } else {
+      // 2) fall back to SC query to check service state (fast, still cmd)
+      const scLine = `sc query "${SERVICE_NAME}" | findstr /I RUNNING >nul && echo svc=Running || echo svc=Stopped`;
+      const r2 = await runCommandsAndWait(nodeId, 'bat', scLine, false);
+      const raw2 = (r2 && r2.raw) ? String(r2.raw) : '';
+      const ms = /svc\s*=\s*(Running|Stopped)/i.exec(raw2);
+      if (r2 && r2.ok === true && ms) {
+        const svcRunning = /Running/i.test(ms[1]);
+        result = { status: (svcRunning ? 'Running' : 'Stopped'), port20707:false, port20773:false };
+      } else {
+        result = { status:'Unknown', port20707:false, port20773:false };
+      }
+    }
+
+    const wrapped = result;
+    cache.set(nodeId, { t: now, result: wrapped });
+    return wrapped;
   }
 
   // ===== Admin bridge endpoints =====
@@ -160,16 +188,15 @@ module.exports.onedrivecheck = function (parent) {
         ids = ids.map(normalizeId);
 
         const out = {};
-        // Process limited parallelism
         const queue = ids.slice();
-        const MAX_PAR = 8;
+        const MAX_PAR = 6;
         async function worker(){
           while(queue.length){
             const id = queue.shift();
             try {
-              if (!isAgentOnline(id)) { out[id] = { status:'Offline', port20707:false, port20773:false, raw:'' }; continue; }
-              out[id] = await probeWindowsFast(id);
-            } catch (e) { err(e); out[id] = { status:'Error', port20707:false, port20773:false, raw:'' }; }
+              if (!isAgentOnline(id)) { out[id] = { status:'Offline', port20707:false, port20773:false }; continue; }
+              out[id] = await probeNode(id);
+            } catch (e) { err(e); out[id] = { status:'Unknown', port20707:false, port20773:false }; }
           }
         }
         await Promise.all(Array.from({length: Math.min(MAX_PAR, ids.length)}, worker));
@@ -177,17 +204,16 @@ module.exports.onedrivecheck = function (parent) {
         return;
       }
 
-      // Minimal admin page for sanity check
+      // tiny landing page (optional)
       if (req.query.admin == 1) {
         if (!user) { res.status(401).end('Unauthorized'); return; }
         res.setHeader("Content-Type","text/html; charset=utf-8");
         res.end(`<!doctype html><meta charset="utf-8"><title>OneDriveCheck</title>
           <h2>OneDriveCheck</h2>
-          <p>Use device list; a column will appear after page loads. Device page shows a pill.</p>
+          <p>Column appears on the device list; a pill appears on the device page.</p>
           <ul>
             <li><a href="?pin=onedrivecheck&debug=1">debug</a></li>
             <li><a href="?pin=onedrivecheck&listonline=1">listonline</a></li>
-            <li>UI JS: <code>/pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js</code></li>
           </ul>`);
         return;
       }
@@ -196,18 +222,18 @@ module.exports.onedrivecheck = function (parent) {
     } catch (e) { err(e); res.sendStatus(500); }
   };
 
-  // Inject our UI script (served by admin bridge, CSP-safe, same-origin)
+  // Inject UI (CSP-safe, served by admin bridge)
   obj.onWebUIStartupEnd = function () {
     const v = (Date.now() % 1e6);
     return `<script src="/pluginadmin.ashx?pin=onedrivecheck&include=1&path=ui.js&v=${v}"></script>`;
   };
 
-  // ====== Client JS (column + pill) ======
+  // ====== Client JS (column + pill; no raw output shown) ======
   function buildClientJS(){
     return `(()=>{"use strict";
-  const log=(...a)=>{ try{console.log("%c[ODC]","color:#06c;font-weight:700",...a);}catch{} };
+  const tidy = s => (s||"").trim();
 
-  // Resolve table elements across skins
+  // Resolve device list table across skins
   function table(){
     return document.querySelector('#devices')
         || document.querySelector('#devicesTable')
@@ -229,7 +255,6 @@ module.exports.onedrivecheck = function (parent) {
       const th=document.createElement('th'); th.id='col_onedrivecheck'; th.textContent='OneDriveCheck';
       th.style.whiteSpace='nowrap';
       tr.appendChild(th);
-      log("header added");
     }
     return true;
   }
@@ -240,34 +265,32 @@ module.exports.onedrivecheck = function (parent) {
     rows.forEach(r=>{
       if(!r.querySelector('.onedrivecheck-cell')){
         const td=document.createElement('td'); td.className='onedrivecheck-cell'; td.textContent='—';
-        td.style.whiteSpace='nowrap';
+        td.style.whiteSpace='nowrap'; td.style.fontWeight='600';
         r.appendChild(td);
       }
       const id=rowId(r); if(id) ids.push(id);
     });
     return ids;
   }
+  function colorFor(status){
+    const s = tidy(status).toLowerCase();
+    if (s.startsWith('running')) return '#0a0';
+    if (s === 'offline') return '#c00';
+    if (s === 'stopped') return '#c00';
+    return '#666'; // unknown
+  }
   function paintList(map){
     const g=table(); if(!g) return;
     g.querySelectorAll('tbody tr').forEach(r=>{
-      const id=rowId(r); const td=r.querySelector('.onedrivecheck-cell'); if(!td) return;
-      const s=(id && map && map['node//'+id])?map['node//'+id]:null;
-      if(!s){ td.textContent='—'; td.dataset.state=''; td.title=''; td.style.color=''; td.style.fontWeight=''; return; }
-      td.textContent = s.status || '—';
-      td.title = '20707:'+(s.port20707?'open':'closed')+', 20773:'+(s.port20773?'open':'closed');
-      const state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
-      td.dataset.state = state;
-      td.style.color = (state==='online'?'#0a0':(state==='notsigned'?'#b80':'#c00'));
-      td.style.fontWeight = '600';
+      const short=rowId(r); const td=r.querySelector('.onedrivecheck-cell'); if(!td) return;
+      const data = map && (map['node//'+short] || map[short]);
+      if(!data){ td.textContent='—'; td.style.color='#666'; return; }
+      const label = data.status || 'Unknown';
+      td.textContent = label;
+      td.style.color = colorFor(label);
     });
   }
-  function apiStatusLong(longIds){
-    const qs = longIds.map(id=>'&id='+encodeURIComponent(id)).join('');
-    return fetch('/pluginadmin.ashx?pin=onedrivecheck&status=1'+qs, { credentials:'same-origin' })
-      .then(r=>r.json()).catch(()=>({}));
-  }
   function apiStatusShort(shortIds){
-    // server accepts short or long; normalize on server
     const qs = shortIds.map(id=>'&id='+encodeURIComponent(id)).join('');
     return fetch('/pluginadmin.ashx?pin=onedrivecheck&status=1'+qs, { credentials:'same-origin' })
       .then(r=>r.json()).catch(()=>({}));
@@ -300,12 +323,14 @@ module.exports.onedrivecheck = function (parent) {
     return pill;
   }
   function paintDevice(map){
-    const id=currentNodeId(); if(!id) return;
-    const s=map['node//'+id]; const pill=ensureDevicePill(); if(!pill) return;
-    if(!s){ pill.textContent='OneDriveCheck: —'; pill.style.color='#666'; return; }
-    const state = (s.port20707 ? 'online' : (s.port20773 ? 'notsigned' : 'offline'));
-    pill.textContent='OneDriveCheck: ' + (s.status||'—') + '  (20707:'+(s.port20707?'open':'closed')+', 20773:'+(s.port20773?'open':'closed')+')';
-    pill.style.color = (state==='online'?'#0a0':(state==='notsigned'?'#b80':'#c00'));
+    const short=currentNodeId(); if(!short) return;
+    const pill=ensureDevicePill(); if(!pill) return;
+    const data = map && (map['node//'+short] || map[short]);
+    if(!data){ pill.textContent='OneDriveCheck: —'; pill.style.color='#666'; return; }
+    const label = data.status || 'Unknown';
+    pill.textContent = 'OneDriveCheck: ' + label;
+    pill.style.color = ('${''}'.length ? '#06c' : (label.toLowerCase().startsWith('running') ? '#0a0' : (label.toLowerCase()==='stopped'||label.toLowerCase()==='offline') ? '#c00' : '#666'));
+    // ^ keep simple: green running, red stopped/offline, gray unknown
   }
   function tickDevice(){
     const id=currentNodeId(); if(!id) return;
