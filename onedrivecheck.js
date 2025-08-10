@@ -76,15 +76,16 @@ module.exports.onedrivecheck = function (parent) {
   const parseBool = (s)=> /true/i.test(String(s||""));
 
   async function probePortsWindows(nodeId){
-    // Try a .NET TcpClient probe first (works on older PS too), then fall back to Test-NetConnection
+    // Probe 20707 & 20773 via agent PowerShell (Windows)
     const ps = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ' +
-      "\"function T($p){try{$c=New-Object Net.Sockets.TcpClient; $iar=$c.BeginConnect('127.0.0.1',$p,$null,$null); $ok=$iar.AsyncWaitHandle.WaitOne(2000); if($ok){$c.EndConnect($iar);$c.Close();$true}else{$false}}catch{$false}}; " +
-      "$p1=T 20707; $p2=T 20773; if($p1 -eq $null -or $p2 -eq $null){$p1=(Test-NetConnection -ComputerName localhost -Port 20707 -WarningAction SilentlyContinue).TcpTestSucceeded; $p2=(Test-NetConnection -ComputerName localhost -Port 20773 -WarningAction SilentlyContinue).TcpTestSucceeded}; " +
+      "\"$p1=(Test-NetConnection -ComputerName localhost -Port 20707 -WarningAction SilentlyContinue).TcpTestSucceeded; " +
+      "$p2=(Test-NetConnection -ComputerName localhost -Port 20773 -WarningAction SilentlyContinue).TcpTestSucceeded; " +
       "Write-Output ('p1=' + $p1 + ';p2=' + $p2)\"";
+
     const out = await sendShell(nodeId, ps);
     const m = /p1\s*=\s*(true|false).*?p2\s*=\s*(true|false)/i.exec(out||"");
-    const p1 = m ? /true/i.test(m[1]) : false;
-    const p2 = m ? /true/i.test(m[2]) : false;
+    const p1 = m ? parseBool(m[1]) : false;
+    const p2 = m ? parseBool(m[2]) : false;
     const status = p1 ? "App Online" : (p2 ? "Not signed in" : "Offline");
     return { status, port20707: !!p1, port20773: !!p2, raw: out };
   }
@@ -157,5 +158,3 @@ module.exports.onedrivecheck = function (parent) {
   log("onedrivecheck SAFE baseline loaded");
   return obj;
 };
-
-
