@@ -1,10 +1,10 @@
 {
-  "name": "OneDriveCheckService Monitor",
+  "name": "OneDriveCheck (fast)",
   "shortName": "onedrivecheck",
-  "version": "0.2.43",
-  "author": "Thorsen Klingelhoeffer",
-  "description": "Monitors OneDriveCheckService, restarts if offline, shows status in device view.",
-  "hasAdminPanel": true,
+  "version": "0.3.0",
+  "author": "you",
+  "description": "Fast status check using agent-side CMD + netstat via admin bridge.",
+  "hasAdminPanel": false,
   "homepage": "https://github.com/ThorNeoV/OneMonitor",
   "changelogUrl": "https://raw.githubusercontent.com/ThorNeoV/OneMonitor/refs/heads/main/README.md",
   "configUrl": "https://raw.githubusercontent.com/ThorNeoV/OneMonitor/refs/heads/main/config.json",
@@ -13,13 +13,8 @@
     "type": "git",
     "url": "https://github.com/ThorNeoV/OneMonitor.git"
   },
-
   "meshCentralCompat": ">=1.0.0"
 }
-
-
-
-
 
 
 
