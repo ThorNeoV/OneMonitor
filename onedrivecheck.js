@@ -1,19 +1,18 @@
 "use strict";
 
 /**
- * OneDriveCheck – SAFE admin panel (iframe tab)
- * - No onWebUIStartupEnd, no global UI injection, no Express hooks.
+ * OneDriveCheck – Admin panel only (SAFE: no UI hooks)
+ * - No onWebUIStartupEnd, no onDeviceRefreshEnd, no DOM injection.
  * - Only uses pluginadmin.ashx admin-bridge endpoints.
  *
- * UI:
- *   Adds a "OneDriveCheck" tab under Plugins on device pages, loading:
- *     /pluginadmin.ashx?pin=onedrivecheck&user=1
- *
- * Endpoints (while logged-in):
+ * Endpoints (logged-in):
+ *   /pluginadmin.ashx?pin=onedrivecheck&user=1         ← admin panel (standalone page)
  *   /pluginadmin.ashx?pin=onedrivecheck&health=1
  *   /pluginadmin.ashx?pin=onedrivecheck&whoami=1
- *   /pluginadmin.ashx?pin=onedrivecheck&listonline=1
- *   /pluginadmin.ashx?pin=onedrivecheck&svc=1&id=<nodeId or shortId>   ← returns ports + service state
+ *   /pluginadmin.ashx?pin=onedrivecheck&listonline=1   ← local server only (peering note)
+ *   /pluginadmin.ashx?pin=onedrivecheck&svc=1&id=<nodeId or shortId>  ← ports+service
+ *
+ * Uses RunCommands with reply:true; replies handled by hook_processAgentData.
  */
 
 module.exports.onedrivecheck = function (parent) {
@@ -22,22 +21,15 @@ module.exports.onedrivecheck = function (parent) {
   obj.meshServer = parent.parent;      // MeshCentral server
   const wsserver = obj.meshServer && obj.meshServer.webserver;
 
-  // Keep exports minimal & safe (like ScriptTask)
-  obj.exports = [
-    "onDeviceRefreshEnd",
-    "handleAdminReq",
-    "hook_processAgentData"
-  ];
+  // Minimal, safe exports – no UI hooks
+  obj.exports = ["handleAdminReq", "hook_processAgentData"];
 
-  // --- constants
   const SERVICE_NAME = "OneDriveCheckService";
-  const PANEL_HEIGHT = 720; // px
 
-  // --- logging (quiet)
+  // light logging
   const log = (m)=>{ try{ obj.meshServer.info("onedrivecheck: " + m); }catch{} };
   const err = (e)=>{ try{ obj.meshServer.debug("onedrivecheck error: " + (e && e.stack || e)); }catch{} };
 
-  // --- helpers
   const summarizeUser = (u)=> u ? ({ name:u.name, userid:u.userid, domain:u.domain, siteadmin:u.siteadmin }) : null;
   const parseBool = (v)=> /^true$/i.test(String(v).trim());
   const normalizeId = (id)=> (!id ? id : (/^node\/\/.+/i.test(id) ? id : ('node//' + id)));
@@ -59,14 +51,13 @@ module.exports.onedrivecheck = function (parent) {
     return out;
   }
 
-  // ===== RunCommands with reply:true (works in peering on >= 1.1.40)
+  // ===== RunCommands with reply:true
   const pend = new Map(); // responseid -> {resolve,timeout}
   const makeResponseId = ()=> 'odc_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
 
   obj.hook_processAgentData = function(agent, command) {
     try {
       if (!command) return;
-      // RunCommands replies arrive here
       if (command.action === 'runcommands' && command.responseid) {
         const p = pend.get(command.responseid);
         if (p) {
@@ -117,9 +108,8 @@ module.exports.onedrivecheck = function (parent) {
     });
   }
 
-  // ===== Probes (fast; pure CMD, no admin needed)
+  // Combined quick probe: ports + service
   async function getSvcAndPorts(nodeId){
-    // Combine fast netstat checks + SC query
     const bat = [
       '(netstat -an | findstr /C::20707 >nul && echo p1=True || echo p1=False) & (netstat -an | findstr /C::20773 >nul && echo p2=True || echo p2=False)',
       `sc query "${SERVICE_NAME}" | findstr /I RUNNING >nul && echo svc=Running || echo svc=NotRunning`
@@ -128,7 +118,6 @@ module.exports.onedrivecheck = function (parent) {
     const res = await runCommandsAndWait(nodeId, 'bat', bat, false);
     const raw = (res && res.raw) ? String(res.raw) : '';
 
-    // Parse p1/p2/svc
     const m1 = /p1\s*=\s*(true|false)/i.exec(raw);
     const m2 = /p2\s*=\s*(true|false)/i.exec(raw);
     const mS = /svc\s*=\s*(Running|NotRunning)/i.exec(raw);
@@ -140,19 +129,9 @@ module.exports.onedrivecheck = function (parent) {
     return { ok:!!res?.ok, status, port20707: !!p1, port20773: !!p2, service: svc, raw };
   }
 
-  // ===== Web UI hook: add a Plugins tab (like ScriptTask)
-  obj.onDeviceRefreshEnd = function () {
-    try {
-      // Register a tab and load our panel via iframe (keeps everything isolated)
-      pluginHandler.registerPluginTab({ tabTitle: 'OneDriveCheck', tabId: 'pluginOneDriveCheck' });
-      QA('pluginOneDriveCheck', '<iframe id="odcFrame" style="width:100%;height:'+PANEL_HEIGHT+'px;overflow:auto" frameBorder="0" src="/pluginadmin.ashx?pin=onedrivecheck&user=1"></iframe>');
-    } catch(e){ err(e); }
-  };
-
-  // ===== Admin bridge: serve JSON & our minimal panel
+  // ===== admin bridge (panel + JSON)
   obj.handleAdminReq = async function(req, res, user) {
     try {
-      // JSON helpers
       if (req.query.health == 1) { res.json({ ok:true, plugin:'onedrivecheck', exports:obj.exports }); return; }
       if (req.query.whoami == 1) {
         if (!user) { res.status(401).json({ ok:false, reason:'no user' }); return; }
@@ -171,7 +150,6 @@ module.exports.onedrivecheck = function (parent) {
         res.json({ id, ...out }); return;
       }
 
-      // Our panel (loaded inside iframe tab)
       if (req.query.user == 1) {
         if (!user) { res.status(401).end('Unauthorized'); return; }
         res.setHeader('Content-Type','text/html; charset=utf-8');
@@ -189,26 +167,21 @@ module.exports.onedrivecheck = function (parent) {
   button:hover{background:#f0f0f0}
   pre{white-space:pre-wrap;word-break:break-word;background:#fafafa;border:1px solid #eee;border-radius:8px;padding:10px;max-height:300px;overflow:auto;margin:8px 0 0}
   .muted{color:#666;font-size:12px}
-  .ok{color:#0a0;font-weight:600}
-  .warn{color:#b80;font-weight:600}
-  .bad{color:#c00;font-weight:600}
 </style>
 <h2>OneDriveCheck</h2>
 <div class="grid">
   <div class="card">
     <div class="row"><strong>Health</strong><button onclick="loadHealth()">Refresh</button></div>
     <pre id="out-health">Loading…</pre>
-    <div class="muted">/pluginadmin.ashx?pin=onedrivecheck&amp;health=1</div>
   </div>
   <div class="card">
     <div class="row"><strong>Who am I</strong><button onclick="loadWho()">Refresh</button></div>
     <pre id="out-who">Loading…</pre>
-    <div class="muted">/pluginadmin.ashx?pin=onedrivecheck&amp;whoami=1</div>
   </div>
   <div class="card">
     <div class="row"><strong>Online (this server)</strong><button onclick="loadOnline()">Refresh</button></div>
     <pre id="out-online">Loading…</pre>
-    <div class="muted">Peering note: shows only agents connected to this server.<br>/pluginadmin.ashx?pin=onedrivecheck&amp;listonline=1</div>
+    <div class="muted">Peering note: shows only agents connected to THIS server.</div>
   </div>
   <div class="card">
     <div class="row"><strong>Check a node</strong></div>
@@ -217,7 +190,7 @@ module.exports.onedrivecheck = function (parent) {
       <button onclick="checkNode()">Check service & ports</button>
     </div>
     <pre id="out-node">Enter an id, then click “Check”.</pre>
-    <div class="muted">Service: ${SERVICE_NAME} • Ports: 20707 / 20773<br>/pluginadmin.ashx?pin=onedrivecheck&amp;svc=1&amp;id=…</div>
+    <div class="muted">Service: ${SERVICE_NAME} • Ports: 20707 / 20773</div>
   </div>
 </div>
 <script>
@@ -247,11 +220,10 @@ module.exports.onedrivecheck = function (parent) {
         return;
       }
 
-      // nothing matched
       res.sendStatus(404);
     } catch (e) { err(e); res.sendStatus(500); }
   };
 
-  log("onedrivecheck panel loaded");
+  log("onedrivecheck (panel-only) loaded");
   return obj;
 };
