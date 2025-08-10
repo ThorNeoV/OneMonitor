@@ -1,7 +1,7 @@
 {
   "name": "OneDriveCheck (fast)",
   "shortName": "onedrivecheck",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "author": "you",
   "description": "Fast status check using agent-side CMD + netstat via admin bridge.",
   "hasAdminPanel": true,
@@ -15,6 +15,7 @@
   },
   "meshCentralCompat": ">=1.0.0"
 }
+
 
 
 
